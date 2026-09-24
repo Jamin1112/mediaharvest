@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mediaharvest"
+version = "1.0.0"
+description = "网页图片/视频爬取下载工具：支持静态页、JS 动态页、m3u8 流与主流视频平台"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+keywords = ["crawler", "scraper", "image", "video", "m3u8", "hls", "downloader"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+  "httpx[http2]>=0.24",
+  "beautifulsoup4>=4.11",
+  "lxml>=4.9",
+  "playwright>=1.30",
+  "flask>=2.2",
+  "yt-dlp>=2023.1.1",
+  "m3u8>=1.0",
+  "pycryptodome>=3.15",
+  # 配置文件（下载地址等）的 TOML 解析；3.11+ 用内置 tomllib
+  "tomli>=1.1.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+mh = "mediaharvest.cli:main"
+mh-web = "mediaharvest.web:main"
+
+[tool.setuptools]
+packages = ["mediaharvest"]
+
+[tool.setuptools.package-data]
+mediaharvest = ["py.typed"]

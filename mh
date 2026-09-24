@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# mediaharvest 命令行入口（自动使用项目内虚拟环境）
+set -euo pipefail
+cd "$(dirname "$0")"
+if [ ! -x ".venv/bin/python" ]; then
+  echo "错误: 未找到虚拟环境，请先运行 ./setup.sh" >&2
+  exit 1
+fi
+exec ./.venv/bin/python -m mediaharvest "$@"

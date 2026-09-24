@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+# 工作区内自建的字节码缓存目录（结构镜像工作区，等同 __pycache__）
+.pycache/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 项目内虚拟环境与浏览器（体积大，不入库）
+.venv/
+.playwright-browsers/
+
+# 下载产物
+downloads/
+*.part
+
+# 本地配置
+.env
+config.local.*
+# mh --set-out-dir 写入的本地下载地址（含机器相关路径，不入库）
+mediaharvest.toml
+
+# 测试产物
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
