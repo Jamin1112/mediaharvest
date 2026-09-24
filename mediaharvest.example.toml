@@ -1,0 +1,98 @@
+# mediaharvest 示例配置
+#
+# 使用方式：
+#   cp mediaharvest.example.toml mediaharvest.toml
+#   ./mh --show-config
+#
+# 说明：
+# - mediaharvest.toml 是本机配置，已被 .gitignore 忽略，不建议提交。
+# - 这里不要填写真实 Cookie、账号信息或只属于你电脑的私密路径。
+# - 命令行参数 > 环境变量 > mediaharvest.toml > 内置默认值。
+
+[download]
+# 下载保存目录。支持 ~、$VAR 和相对路径。
+out_dir = "~/Downloads/mediaharvest"
+
+# 普通文件下载并发数，建议 1-32。
+concurrency = 8
+
+# HLS/m3u8 分片下载并发数。
+hls_concurrency = 8
+
+# 单文件体积限制，留空表示不限。例如 "200M"、"5K"。
+max_size = ""
+min_size = ""
+
+# 是否覆盖同名文件。
+overwrite = false
+
+# true 表示不按 image/video/audio 分目录，全部平铺保存。
+flat = false
+
+# HLS 转 MP4 后是否保留原始 .ts 分片。
+keep_ts = false
+
+[web]
+# 127.0.0.1 仅本机访问；0.0.0.0 允许局域网访问。
+host = "127.0.0.1"
+port = 8848
+open_browser = true
+
+[crawl]
+# render: auto / always / never
+render = "auto"
+
+# use_ytdlp: auto / always / never
+use_ytdlp = "auto"
+
+timeout = 20.0
+retries = 2
+wait_after_load = 1.5
+browser_timeout = 30.0
+
+# 渲染页面时自动滚动，触发懒加载。
+scroll = true
+
+# false 会弹出浏览器窗口，适合调试登录或页面加载问题。
+headless = true
+
+# 站内继续爬取的深度。0 表示只抓当前页。
+depth = 0
+max_pages = 1
+same_host_only = false
+
+# 默认抓取类型：image,video,audio,hls,dash
+types = "image,video"
+
+[music]
+enabled = true
+
+# best / lossless / high / medium / low
+quality = "best"
+
+expand_playlists = true
+playlist_limit = 200
+lyrics = true
+cover = true
+tags = true
+lrc_file = false
+
+[network]
+# 代理示例："http://127.0.0.1:7890"，留空不用代理。
+proxy = ""
+
+# 留空使用内置浏览器 UA。
+user_agent = ""
+
+# 不建议把真实 Cookie 写进会提交的文件。
+cookie = ""
+
+# 可选：chrome / firefox / edge / safari
+cookies_from_browser = ""
+
+[advanced]
+# 防止直播流或异常 m3u8 无限下载。
+max_segments = 20000
+
+# 自动把 HLS 转封装为 MP4。
+remux = true

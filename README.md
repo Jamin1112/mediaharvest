@@ -154,6 +154,16 @@ cover = true              # 抓封面
 tags = true               # 写入 ID3 标签
 ```
 
+仓库里提供了一个安全的示例文件，可以复制后按自己的机器修改：
+
+```bash
+cp mediaharvest.example.toml mediaharvest.toml
+./mh --show-config
+```
+
+真实的 `mediaharvest.toml` 已加入 `.gitignore`，不建议上传，因为里面可能包含本机路径、
+代理、Cookie 或浏览器登录相关配置。
+
 **优先级**（从高到低）：
 
 1. 命令行 `-o ~/Downloads/other`
