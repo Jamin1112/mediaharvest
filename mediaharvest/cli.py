@@ -37,6 +37,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = "mediaharvest"
 
+from . import music as music_mod
 from . import ytdlp as ytdlp_mod
 from .browser import ensure_browser_path, playwright_available
 from .config import (
@@ -140,6 +141,24 @@ def build_parser() -> argparse.ArgumentParser:
     g2.add_argument("--depth", type=int, default=None, help="跟随站内链接的深度（0 只抓当前页）")
     g2.add_argument("--max-pages", type=int, default=None, help="最多抓取页面数")
     g2.add_argument("--link-pattern", default="", help="只跟随匹配该正则的链接")
+
+    # 音乐
+    gm = parser.add_argument_group("音乐")
+    gm.add_argument("--no-music", action="store_true", default=None,
+                    help="关闭音乐通道（音乐 URL 按普通网页处理）")
+    gm.add_argument("--quality", choices=music_mod.quality_keys(), default=None,
+                    help="音质档位：best 最高 / lossless 仅无损 / high / medium / low 省流")
+    gm.add_argument("--no-playlist", dest="no_playlist", action="store_true", default=None,
+                    help="不展开专辑/歌单/歌手，只抓单个目标")
+    gm.add_argument("--playlist-limit", type=int, default=None,
+                    help="单个专辑/歌单最多抓多少首（默认 200，防止巨型歌单失控）")
+    gm.add_argument("--no-lyrics", action="store_true", default=None, help="不抓取歌词")
+    gm.add_argument("--no-cover", action="store_true", default=None, help="不抓取并嵌入封面")
+    gm.add_argument("--no-tags", action="store_true", default=None, help="下载后不写音乐标签")
+    gm.add_argument("--lrc-file", action="store_true", default=None,
+                    help="在音频文件旁额外保存 .lrc 歌词文件")
+    gm.add_argument("--music-info", action="store_true",
+                    help="只识别音乐 URL 的平台与类型后退出")
 
     # 网络
     g3 = parser.add_argument_group("网络")
@@ -318,6 +337,27 @@ def selfcheck() -> int:
         print(f"  内置转封装  : {green('可用')}")
     except ImportError:
         print(f"  内置转封装  : {dim('未启用（.ts 仍可播放）')}")
+
+    # 音乐标签写入：有 mutagen 最好，没有则用内置纯 Python 实现
+    try:
+        from .tags import mutagen_available, write_tags  # noqa: F401
+
+        if mutagen_available():
+            print(f"  音乐标签    : {green('可用')} (mutagen)")
+        else:
+            print(f"  音乐标签    : {green('可用')} (内置实现，建议 pip install mutagen)")
+    except ImportError:
+        print(f"  音乐标签    : {yellow('不可用')} ← 无法写入 ID3/歌词")
+        ok = False
+
+    try:
+        from . import music as _music
+
+        supported = [p.name for p in _music.MUSIC_PLATFORMS if p.supported]
+        print(f"  音乐平台    : {green(str(len(supported)) + ' 个可抓')} "
+              f"{dim('（' + '、'.join(supported[:4]) + ' 等）')}")
+    except Exception:
+        print(f"  音乐平台    : {yellow('不可用')}")
 
     try:
         from Crypto.Cipher import AES  # noqa: F401
@@ -519,6 +559,17 @@ async def run(args: argparse.Namespace) -> int:
         print(f"  查看/生成配置: mh --show-config / mh --init-config")
         return 2
 
+    # 只识别音乐 URL 就退出：排查「为什么这个链接抓不到」时最有用
+    if args.music_info:
+        print(bold(args.url))
+        print("  " + music_mod.describe(args.url))
+        target = music_mod.classify_music_url(args.url)
+        if target.platform:
+            print(dim(f"  platform={target.platform.key} kind={target.kind.value} "
+                      f"track_id={target.track_id or '-'} album_id={target.album_id or '-'} "
+                      f"playlist_id={target.playlist_id or '-'}"))
+        return 0
+
     # 配置文件提供默认值，命令行参数优先
     cfg = load_config(args.config)
     if cfg.error:
@@ -577,6 +628,15 @@ async def run(args: argparse.Namespace) -> int:
                                   "network.cookies_from_browser") or "",
         cookie_file=args.cookie_file,
         types=types,
+        # 音乐：这些开关都是「命令行只能关，配置可以开」，因此用取反合并
+        music=not (bool(args.no_music) or not bool(cfg.get("music.enabled"))),
+        quality=str(pick(args.quality, "music.quality") or "best"),
+        expand_playlists=not (bool(args.no_playlist)
+                              or not bool(cfg.get("music.expand_playlists"))),
+        playlist_limit=max(1, int(pick(args.playlist_limit, "music.playlist_limit") or 200)),
+        music_lyrics=not (bool(args.no_lyrics) or not bool(cfg.get("music.lyrics"))),
+        music_cover=not (bool(args.no_cover) or not bool(cfg.get("music.cover"))),
+        music_tags=not (bool(args.no_tags) or not bool(cfg.get("music.tags"))),
     )
 
     quiet = args.quiet or args.json_out
@@ -656,6 +716,8 @@ async def run(args: argparse.Namespace) -> int:
             remux=bool(cfg.get("advanced.remux")),
             flat=flag(args.flat, "download.flat"),
             keep_ts=flag(args.keep_ts, "download.keep_ts"),
+            music_tags=options.music_tags,
+            write_lyrics_file=flag(args.lrc_file, "music.lrc_file"),
         )
 
         if not quiet and selected and any(

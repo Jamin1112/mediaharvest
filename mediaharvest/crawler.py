@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 from urllib.parse import urljoin, urlsplit
 
+from . import lyrics as lyrics_mod
+from . import music as music_mod
 from . import ytdlp as ytdlp_mod
 from .browser import BrowserRenderer, PlaywrightUnavailable, playwright_available
 from .extractor import Extractor
@@ -45,6 +47,16 @@ KNOWN_VIDEO_SITES = (
     "kuaishou.com", "weibo.com", "acfun.cn", "iqiyi.com", "youku.com",
     "qq.com", "twitch.tv", "reddit.com", "facebook.com", "soundcloud.com",
 )
+
+#: 音乐站点表来自 :data:`mediaharvest.music.MUSIC_PLATFORMS`——
+#: 单一数据源，避免这里再维护一份会漂移的域名列表。
+def _music_hosts() -> tuple:
+    """音乐平台域名（延迟求值，避免导入期依赖）。"""
+    try:
+        return tuple(d for p in music_mod.MUSIC_PLATFORMS for d in p.domains)
+    except Exception:  # pragma: no cover - 防御性
+        return ()
+
 
 #: 判断「页面是 SPA 空壳」的信号
 SPA_MARKERS = (
@@ -89,6 +101,14 @@ class CrawlOptions:
     min_width: int = 0
     types: Sequence[str] = ()      # 只保留指定类型，如 ("image","video")
     dedupe_thumbnails: bool = True
+    # 音乐
+    music: bool = True             # 是否启用音乐通道（识别音乐站点并按音频流抓取）
+    quality: str = "best"          # 音质档位：best/lossless/high/medium/low
+    expand_playlists: bool = True  # 专辑/歌单/歌手是否展开成多条曲目
+    playlist_limit: int = 200      # 单个集合最多展开多少首
+    music_lyrics: bool = True      # 抓取歌词
+    music_cover: bool = True       # 抓取并嵌入封面
+    music_tags: bool = True        # 下载后写入音乐标签
 
     def wants(self, mtype: MediaType) -> bool:
         if not self.types:
@@ -159,6 +179,14 @@ class Crawler:
 
         kind = classify(url)
 
+        # 0) 已知音乐平台：走音乐通道。
+        #    放在最前面是因为音乐 URL 常被误判：/audio/au123 会被当成普通
+        #    音频直链，music.163.com/song 会被当成普通网页。音乐通道要的是
+        #    「先探测出曲目信息，再按音质选流」，普通通道给不了这些。
+        music_items: List[MediaItem] = []
+        if self.opt.music:
+            music_items = await self._crawl_music(url, report, progress=progress)
+
         # 1) 直接就是媒体文件 / 流
         if kind in (MediaType.IMAGE, MediaType.VIDEO, MediaType.AUDIO,
                     MediaType.HLS, MediaType.DASH, MediaType.SEGMENT):
@@ -168,10 +196,33 @@ class Crawler:
                 url=url, type=kind, source=Source.TAG, page_url=url,
                 ext=url_ext(url), referer=url,
             )
+            # 音乐站点给的条目更完整（带标签与正确音质），优先保留
             page = PageCapture(url=url, final_url=url, title=url.rsplit("/", 1)[-1])
-            page.items = [item]
+            page.items = _dedupe_by_url(music_items + [item])
             report.pages.append(page)
-            report.items = [item]
+            report.items = page.items
+            return report
+
+        # 音乐平台已解析出结果就不再走通用网页通道：
+        # 音乐站点的页面大多是 JS 空壳，继续抓只会捞回一堆封面图噪声。
+        if music_items:
+            page = PageCapture(url=url, final_url=url)
+            page.title = music_items[0].music.album if music_items[0].music else ""
+            page.items = _dedupe_by_url(music_items)
+            report.pages.append(page)
+            report.items = self._merge([page.items], report, page_url=url)
+            if progress:
+                progress("done", f"共发现 {len(report.items)} 个媒体资源")
+            return report
+
+        # 已知音乐平台但音乐通道失败：**不再回退**到通用网页通道。
+        # 理由是对音乐 URL 来说，通用通道只能捞到几十张封面/图标，
+        # 既不是用户要的东西，还会把真正的失败原因（如「专辑接口失效」）
+        # 淹没在一堆看似成功的结果里。这里直接带着错误信息返回。
+        if music_mod.is_music_url(url):
+            report.items = []
+            if progress:
+                progress("done", "音乐通道未取得结果，详见上方错误")
             return report
 
         # 2) 普通网页：按深度逐层抓取
@@ -211,6 +262,103 @@ class Crawler:
         return report
 
     # ---- 单页抓取 ----------------------------------------------------
+
+    # ---- 音乐通道 ----------------------------------------------------
+
+    async def _crawl_music(
+        self,
+        url: str,
+        report: CrawlReport,
+        *,
+        progress: Optional[ProgressCb] = None,
+    ) -> List[MediaItem]:
+        """音乐平台抓取：识别目标类型 → 探测 → 按音质选流。
+
+        返回空列表表示「不是音乐 URL」或「音乐通道没拿到东西」，
+        两种情况下调用方都会继续走通用的网页/视频通道，因此这里
+        任何失败都不应抛给上层。
+        """
+        if not music_mod.is_music_url(url):
+            report.meta.pop("music_target", None)
+            return []
+
+        target = music_mod.classify_music_url(url)
+        report.meta["music_target"] = target.to_dict()
+
+        platform = target.platform
+        if platform and not platform.supported:
+            msg = (f"{platform.name}：{platform.note or '当前无法解析'}"
+                   if platform.note else f"{platform.name} 当前无法解析")
+            report.errors.append(msg)
+            if progress:
+                progress("warn", f"音乐平台不可用 —— {msg}")
+            return []
+
+        if progress:
+            progress("music", f"识别到{target.platform_name} · {target.kind.label}"
+                              f"（{target.reason}）")
+
+        # 集合目标允许展开；单曲不需要（展开反而可能抓成整张专辑）
+        expand = bool(self.opt.expand_playlists and target.is_collection)
+        limit = max(1, int(self.opt.playlist_limit or 1))
+        if progress and expand:
+            progress("music", f"展开集合（最多 {limit} 首）…")
+
+        items = await ytdlp_mod.probe_items(
+            url,
+            page_url=url,
+            cookies_from_browser=self.opt.cookies_from_browser,
+            cookie_file=self.opt.cookie_file,
+            proxy=self.opt.proxy,
+            quality=self.opt.quality,
+            playlist=expand,
+            playlist_end=limit if expand else 0,
+        )
+
+        if not items:
+            reason = await ytdlp_mod.probe_error(
+                url,
+                cookies_from_browser=self.opt.cookies_from_browser,
+                cookie_file=self.opt.cookie_file,
+                proxy=self.opt.proxy,
+                playlist=expand,
+            )
+            report.errors.append(f"{target.platform_name} 解析失败: {reason}")
+            if progress:
+                progress("warn", f"{target.platform_name} 解析失败: {reason}")
+            return []
+
+        audio_count = sum(1 for i in items if i.type == MediaType.AUDIO)
+        if audio_count == 0:
+            # 拿到了曲目信息却没有任何音频流——最典型的原因是「仅无损」
+            # 档位碰上只有有损源的曲目，这种情况必须说清楚而不是静默给空结果。
+            note = (f"{target.platform_name} 未返回可用音频流"
+                    f"（音质档位: {music_mod.get_quality(self.opt.quality).describe()}）")
+            if self.opt.quality == "lossless":
+                note += "；该曲目可能没有无损源，可改用 --quality best"
+            report.errors.append(note)
+            if progress:
+                progress("warn", note)
+
+        if progress:
+            progress("music", f"音乐通道得到 {audio_count} 首曲目")
+
+        # 歌词与封面：只对主选音频补齐，避免给每条备选重复抓
+        if self.opt.music_lyrics or self.opt.music_cover:
+            try:
+                await enrich_music_items(
+                    items, self.fetcher,
+                    want_lyrics=self.opt.music_lyrics,
+                    want_cover=self.opt.music_cover,
+                    progress=progress,
+                )
+            except Exception as exc:  # 歌词失败不该影响下载
+                report.errors.append(f"音乐元信息补全失败: {type(exc).__name__}: {exc}")
+
+        report.meta["music_platform"] = target.platform.key if platform else ""
+        report.meta["music_kind"] = target.kind.value
+        report.meta["music_tracks"] = audio_count
+        return items
 
     async def _crawl_page(
         self, url: str, *, progress: Optional[ProgressCb] = None
@@ -535,6 +683,10 @@ def sort_items(items: Sequence[MediaItem]) -> List[MediaItem]:
     体积在这里是关键信号——流媒体的**初始化分片**（如 B 站的
     ``xxx-1-30216.m4s``）只有十几 KB，却和真实视频同为 ``video`` 类型，
     若不按体积区分，它们会排在完整视频前面误导用户。
+
+    **纯音频条目**单独提前：音乐抓取的主产物就是音频，而 yt-dlp 会顺带
+    给出封面图（image），按类型排会让封面排在歌前面，用户勾选默认项时
+    反而一个音频都没选中。
     """
     type_rank = {
         MediaType.VIDEO: 0, MediaType.HLS: 0, MediaType.DASH: 0,
@@ -549,6 +701,10 @@ def sort_items(items: Sequence[MediaItem]) -> List[MediaItem]:
 
     #: 小于此体积的「视频」几乎必然是初始化分片/占位，降级排序
     TINY_VIDEO_BYTES = 512 * 1024
+
+    def is_music_track(i: MediaItem) -> int:
+        """0 = 音乐曲目，1 = 其它。"""
+        return 0 if (i.type == MediaType.AUDIO and i.music is not None) else 1
 
     def is_real_media(i: MediaItem) -> int:
         """0 = 看起来是完整媒体，1 = 疑似碎片/占位。"""
@@ -566,6 +722,7 @@ def sort_items(items: Sequence[MediaItem]) -> List[MediaItem]:
     return sorted(
         items,
         key=lambda i: (
+            is_music_track(i),
             0 if i.primary else 1,
             is_real_media(i),
             type_rank.get(i.type, 9),
@@ -575,6 +732,101 @@ def sort_items(items: Sequence[MediaItem]) -> List[MediaItem]:
             i.url,
         ),
     )
+
+
+def _dedupe_by_url(items: Sequence[MediaItem]) -> List[MediaItem]:
+    """按 URL 去重并保持首次出现的顺序。"""
+    out: List[MediaItem] = []
+    seen: Set[str] = set()
+    for item in items:
+        if not item.url or item.url in seen:
+            continue
+        seen.add(item.url)
+        out.append(item)
+    return out
+
+
+#: 封面下载上限，避免某些站点给出超大图拖慢抓取
+_MAX_COVER_BYTES = 8 * 1024 * 1024
+
+
+async def enrich_music_items(
+    items: Sequence[MediaItem],
+    fetcher: Any,
+    *,
+    want_lyrics: bool = True,
+    want_cover: bool = True,
+    progress: Optional[ProgressCb] = None,
+) -> None:
+    """给音乐条目补齐歌词与封面图（就地修改）。
+
+    只处理**主选**条目：备选音质条目代表同一首歌，重复抓歌词纯属浪费，
+    一个 100 首的歌单会因此发出 200 次请求。
+
+    这里刻意不抛异常：歌词与封面属于增强信息，拿不到也必须能正常下载。
+    """
+    primary = [i for i in items if i.type == MediaType.AUDIO and i.primary and i.music]
+    if not primary:
+        return
+
+    client = fetcher.client
+    got_lyrics = 0
+    for item in primary:
+        meta = item.music
+        if meta is None:
+            continue
+        if want_lyrics and not meta.lyrics and meta.platform:
+            if lyrics_mod.supports_lyrics(meta.platform):
+                found = await lyrics_mod.fetch_lyrics(
+                    client, meta.platform, meta.track_id,
+                    page_url=item.page_url or meta.platform_name,
+                )
+                if found.ok:
+                    meta.lyrics = found.merged
+                    got_lyrics += 1
+
+    if progress and want_lyrics:
+        progress("music", f"获取到 {got_lyrics}/{len(primary)} 首的歌词")
+
+    if want_cover:
+        # 封面按 URL 缓存：同专辑的歌共用一张图，只下一次
+        cache: Dict[str, bytes] = {}
+        got_cover = 0
+        for item in primary:
+            meta = item.music
+            if meta is None or not meta.cover_url:
+                continue
+            url = meta.cover_url
+            data = cache.get(url)
+            if data is None:
+                data = await _fetch_image(client, url, referer=item.page_url)
+                cache[url] = data
+            if data:
+                # 封面字节放在 item.meta 里传给下载阶段写标签。
+                # 不放 MusicMeta 的原因：MusicMeta 会被序列化成 JSON 发给
+                # Web 前端，塞进几 MB 的二进制会直接卡死接口。
+                item.meta["cover_bytes"] = data
+                got_cover += 1
+        if progress and got_cover:
+            progress("music", f"获取到 {len(cache)} 张封面")
+
+
+async def _fetch_image(client: Any, url: str, *, referer: str = "") -> bytes:
+    """下载一张图片，失败或超限返回空 bytes。"""
+    headers = {"Referer": referer} if referer else None
+    try:
+        resp = await client.get(url, headers=headers, follow_redirects=True)
+    except Exception:
+        return b""
+    if resp.status_code >= 400:
+        return b""
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if ctype and not ctype.startswith("image/"):
+        return b""
+    data = resp.content
+    if not data or len(data) > _MAX_COVER_BYTES:
+        return b""
+    return data
 
 
 def _extract_title(html: str) -> str:

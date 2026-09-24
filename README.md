@@ -1,14 +1,15 @@
 # mediaharvest 🕸️
 
-一个把**网址丢进去就能抓图片和视频**的爬虫工具。命令行和本地网页界面都能用。
+一个把**网址丢进去就能抓图片、视频和音乐**的爬虫工具。命令行和本地网页界面都能用。
 
-不用手动判断页面类型——它会自动在三种通道之间选择最合适的一个：
+不用手动判断页面类型——它会自动在四种通道之间选择最合适的一个：
 
 | 目标类型 | 处理通道 | 能搞定什么 |
 |---|---|---|
 | 普通静态网页 | HTTP + HTML 解析 | `img` / `video` / `srcset` / 懒加载 / CSS 背景图 / `og:` 元信息 / 内联脚本里的地址 |
 | JS 动态网页 | 无头浏览器渲染 + 网络嗅探 | 小红书、微博、Instagram 这类内容靠 JS 加载的站点；嗅探 XHR 里的真实媒体地址 |
 | 视频平台 | yt-dlp 站点适配 | 抖音、B站、YouTube、TikTok 等 1800+ 站点 |
+| 音乐平台 | 音质选择 + 专辑/歌单展开 + 标签写入 | 网易云、SoundCloud 等；整张专辑/歌单抓取，自动写 ID3 标签、歌词与封面 |
 
 流媒体方面内置 **HLS(m3u8)** 支持：自动选最高码流、AES-128 解密、分片并发下载、
 拼接输出；**没有 ffmpeg 也能转成 MP4**（内置纯 Python 转封装实现）。
@@ -31,6 +32,11 @@
 ./mh https://example.com -o ~/Downloads/media  # 指定保存目录
 ./mh "https://example.com/video.m3u8"          # 直接下载视频流
 ./mh https://example.com --interactive         # 交互式挑选要下载的
+
+./mh "https://music.163.com/song?id=347230"                # 抓一首歌
+./mh "https://music.163.com/playlist?id=3778678"           # 整张歌单
+./mh "https://music.163.com/song?id=347230" --quality lossless  # 只要无损
+./mh --music-info "https://y.qq.com/n/ryqq/songDetail/xxx" # 先看这个链接能不能抓
 ```
 
 ### 网页界面
@@ -41,6 +47,86 @@
 
 界面里可以粘贴网址、看到缩略图预览、按类型筛选、勾选想要的资源再下载。
 「保存目录」右侧的 **存为默认** 会把当前目录写进配置文件，下次打开就是它。
+高级选项里有**音质**、**专辑/歌单是否整张抓**、**是否写音乐标签**三个开关。
+
+---
+
+## 音乐抓取
+
+丢一个音乐链接进去就行，工具会自动判断这是单曲、专辑、歌单还是歌手，
+并选好音质：
+
+```bash
+./mh "https://music.163.com/song?id=347230"      # 单曲
+./mh "https://music.163.com/playlist?id=3778678" # 歌单 → 每首歌一条
+./mh "https://soundcloud.com/artist/sets/xxx"    # SoundCloud 合集
+```
+
+抓下来的是什么样：
+
+```
+download/2026-09-24_161500_海阔天空/
+└── audio/
+    └── Beyond - 海阔天空/
+        ├── Beyond-海阔天空.mp3     ← 已写入 ID3：标题/歌手/专辑/年份/封面/歌词
+        └── Beyond-海阔天空.lrc     ← 用 --lrc-file 时额外生成
+```
+
+### 音质档位
+
+| 档位 | 说明 |
+|---|---|
+| `best` | **最高音质**（默认）：无损优先，没有无损就取码率最高的有损 |
+| `lossless` | **仅无损**：只要 flac/alac/wav，**没有无损源就跳过这首**并明确告知 |
+| `high` | 高音质：按编码偏好选（m4a 优先，同感知质量下更省空间） |
+| `medium` | 中等音质：贴近 192kbps |
+| `low` | 省流：贴近 128kbps |
+
+`best` 与 `lossless` 的区别值得注意：前者「尽力给最好的」，后者「宁缺毋滥」——
+想建无损库就用 `lossless`，它会诚实告诉你哪几首没有无损源，而不是悄悄给个 mp3。
+
+### 标签、歌词与封面
+
+下载完成后会自动写入音乐标签，**优先用 mutagen，没装则回退到内置的纯 Python 实现**
+（手写 ID3v2.3 / FLAC Vorbis comment / MP4 `ilst` 原子），所以无额外依赖也能用：
+
+```bash
+./mh <音乐网址> --no-tags      # 不写标签，只存音频
+./mh <音乐网址> --no-lyrics    # 不抓歌词
+./mh <音乐网址> --no-cover     # 不抓封面
+./mh <音乐网址> --lrc-file     # 额外存一份 .lrc 文件
+```
+
+歌词支持双语合并：网易云同时返回原文与翻译时，会按时间轴对齐合并成双语 LRC。
+
+### 平台支持情况
+
+**能抓的**（实测可用）：
+
+| 平台 | 说明 |
+|---|---|
+| 网易云音乐 | 单曲、歌单、歌手；歌词与封面齐全 |
+| SoundCloud / Mixcloud / Audiomack | 单曲与合集 |
+| Bandcamp | 单曲与专辑 |
+| Jamendo / archive.org | 单曲与专辑 |
+| 蜻蜓FM | 音频节目 |
+| YouTube Music | 按普通 YouTube 视频解析 |
+| B站音频 | 仅 `/audio/auXXXX` 路径 |
+
+**抓不了的**（会明确报错，不会假装成功）：
+
+| 平台 | 原因 |
+|---|---|
+| Spotify / Apple Music / Tidal | DRM 保护 |
+| QQ音乐 / 酷狗 / 酷我 / 咪咕 | 接口需签名校验或无可用解析后端 |
+
+```bash
+./mh --music-info "<网址>"    # 抓之前先确认平台与类型
+```
+
+> **关于专辑**：网易云的专辑接口依赖 yt-dlp 的提取器，而该提取器在
+> yt-dlp 2025.10.14 上已失效（上游问题）。歌单与歌手可以正常整张抓取；
+> 专辑目前会明确报错。等上游修复即可自动恢复，无需改动本项目。
 
 ---
 
@@ -59,6 +145,13 @@
 ```toml
 [download]
 out_dir = "~/Downloads/media"
+
+[music]
+quality = "lossless"      # 只要无损
+expand_playlists = true   # 专辑/歌单整张抓
+lyrics = true             # 抓歌词
+cover = true              # 抓封面
+tags = true               # 写入 ID3 标签
 ```
 
 **优先级**（从高到低）：
@@ -144,6 +237,13 @@ out_dir = "~/Downloads/media"
 | `--max-size` / `--min-size` | 单文件体积上下限 |
 | `--keep-ts` | 流媒体转成 MP4 后保留原始 `.ts` |
 | `--hls-concurrency` | HLS 分片下载并发数 |
+| `--quality` | 音质档位：`best`/`lossless`/`high`/`medium`/`low` |
+| `--no-music` | 关闭音乐通道（音乐 URL 按普通网页处理） |
+| `--no-playlist` | 不展开专辑/歌单/歌手，只抓单个目标 |
+| `--playlist-limit` | 单个专辑/歌单最多抓多少首（默认 200） |
+| `--no-lyrics` / `--no-cover` / `--no-tags` | 分别关闭歌词 / 封面 / 标签写入 |
+| `--lrc-file` | 在音频文件旁额外保存 `.lrc` 歌词文件 |
+| `--music-info` | 只识别音乐 URL 的平台与类型后退出 |
 | `--interactive` | 下载前交互式挑选 |
 | `--json-file` | 把结果导出为 JSON |
 | `--list` | 只列出，不下载 |
@@ -172,13 +272,40 @@ async def main():
 asyncio.run(main())
 ```
 
+抓音乐：专辑/歌单会整张展开，每条曲目都带 :class:`MusicMeta`（歌手、专辑、
+曲目号、歌词、封面），下载后自动写入标签。
+
+```python
+import asyncio
+from mediaharvest import Crawler, CrawlOptions, Downloader, classify_music_url
+
+async def main():
+    url = "https://music.163.com/playlist?id=3778678"
+    print(classify_music_url(url).kind.label)      # 歌单
+
+    options = CrawlOptions(types=("audio",), quality="lossless",
+                           expand_playlists=True, playlist_limit=50)
+    async with Crawler(options) as crawler:
+        report = await crawler.crawl(url)
+        for item in report.items:
+            if item.music:
+                print(item.music.display, "|", item.music.album,
+                      "| 歌词", len(item.music.lyrics), "字")
+
+        downloader = Downloader(crawler.fetcher, out_dir="downloads",
+                                music_tags=True)
+        await downloader.download_many(report.items)
+
+asyncio.run(main())
+```
+
 ---
 
 ## 项目结构
 
 ```
 mediaharvest/
-├── models.py      数据模型（MediaItem / MediaType / Source）
+├── models.py      数据模型（MediaItem / MediaType / Source / MusicMeta / TrackKind）
 ├── utils.py       URL 清洗、类型判定、文件名生成
 ├── config.py      配置持久化（下载地址等，TOML）
 ├── fetcher.py     HTTP 层（重试、代理、Cookie、编码嗅探）
@@ -186,9 +313,12 @@ mediaharvest/
 ├── browser.py     无头浏览器渲染 + 网络嗅探
 ├── hls.py         m3u8 解析、AES-128 解密、分片下载拼接
 ├── remux.py       纯 Python MPEG-TS → MP4 转封装（无需 ffmpeg）
-├── ytdlp.py       yt-dlp 集成（视频平台适配）
-├── downloader.py  下载器（并发、重试、去重、命名）
-├── crawler.py     编排层（三级策略自动升级）
+├── ytdlp.py       yt-dlp 集成（视频与音乐平台适配）
+├── music.py       音乐支持（平台识别、目标分类、音质选择、曲目元信息）
+├── lyrics.py      歌词抓取（按平台接口取 LRC 并与译文合并）
+├── tags.py        音乐标签写入（mutagen，缺失时回退纯 Python 实现）
+├── downloader.py  下载器（并发、重试、去重、命名、音乐后处理）
+├── crawler.py     编排层（四级策略自动升级）
 ├── cli.py         命令行入口
 └── web.py         Web 界面（Flask）
 ```
@@ -199,25 +329,41 @@ mediaharvest/
 
 抓取按**成本递增**的顺序逐级尝试，够用就停：
 
-1. **静态解析**——一次 HTTP 请求 + HTML 解析，最快最省资源。
+1. **音乐通道**——URL 命中已知音乐平台时优先走这里。
+   先判断目标是单曲还是专辑/歌单/歌手，集合目标交给 yt-dlp 展开成多条曲目，
+   再按音质档位从各条音频流里选（无损优先、编码偏好、目标码率），
+   最后补齐歌词与封面。命中音乐平台但解析失败时**不再回退**到通用通道——
+   那只会捞回几十张封面图，把真正的原因淹没掉。
+2. **静态解析**——一次 HTTP 请求 + HTML 解析，最快最省资源。
    覆盖 `img`/`video`/`source`、懒加载属性（`data-src` 等）、`srcset` 多分辨率、
    CSS 背景图、`og:image`、内联脚本与 JSON-LD 里的地址、指向媒体的超链接。
-2. **无头渲染**——结果太少、页面是 SPA 空壳、或属于已知动态站点时自动启用。
+3. **无头渲染**——结果太少、页面是 SPA 空壳、或属于已知动态站点时自动启用。
    渲染后重新解析 DOM（能拿到 JS 插入的元素），并**嗅探所有网络请求**，
    按 `Content-Type` 与 URL 特征挑出真实媒体地址。
-3. **yt-dlp**——已知视频平台，或前两级都没找到视频时调用。
+4. **yt-dlp**——已知视频平台，或前几级都没找到视频时调用。
 
 下载阶段：图片/直链视频走高并发 HTTP（带指数退避重试，429/5xx 自动重试）；
-m3u8 走专用通道（选码 → 解密 → 并发拉分片 → 顺序拼接 → 转封装成 MP4）。
+m3u8 走专用通道（选码 → 解密 → 并发拉分片 → 顺序拼接 → 转封装成 MP4）；
+音乐文件下载完成后额外写标签、歌词与封面（写失败不影响音频本身）。
 
 ---
 
 ## 已知限制
 
-- **DRM 加密流**（Widevine 等）无法下载，这是设计如此。
+- **DRM 加密流**（Widevine 等）无法下载，这是设计如此；Spotify/Apple Music/Tidal 因此不可用。
+- **QQ音乐 / 酷狗 / 酷我 / 咪咕**需要签名校验或无可用解析后端，当前抓不了（会明确报错）。
+- **网易云专辑**依赖的 yt-dlp 提取器在 2025.10.14 上已失效（上游问题），
+  歌单与歌手正常；上游修复后自动恢复。
 - **SAMPLE-AES** 加密的 HLS 需要 ffmpeg 或专用工具，内置实现不支持。
 - **DASH (.mpd)** 需要 ffmpeg；没有会明确报错而不是产出坏文件。
 - **纯 Python 转封装**支持 H.264 + AAC；HEVC/H.265 会跳过转封装并保留 `.ts`。
+- **OGG/Opus 标签**在纯 Python 回退模式下不支持（OGG 页级重写过于复杂），
+  会明确报错；装了 mutagen 即可正常写入。支持 `.ogg`/`.oga`/`.ogx`/`.opus`。
+- **WebM/Matroska（`.weba`）** 标签不支持：mutagen 1.47 无对应解析器，
+  强行按 Ogg 处理会写坏文件，因此明确报「不支持」。
+- **分片 MP4（fMP4）** 用纯 Python 回退写标签可能错位：内置实现会平移
+  `stco`/`co64` 采样偏移，但不处理 `moof`/`tfhd` 的 base-data-offset。
+  这类文件请装 mutagen。
 - 直播流（无 `#EXT-X-ENDLIST`）会被分片上限拦住，避免无限下载。
 - 部分站点有强反爬（验证码、签名校验），需要手动提供 Cookie 或改用其它工具。
 - Web 界面的图片预览走本地代理以绕过防盗链，该代理拒绝访问内网地址（防 SSRF）。

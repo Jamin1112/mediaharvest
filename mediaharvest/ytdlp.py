@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import music as music_mod
 from .models import MediaItem, MediaType, Source
 from .utils import human_duration, url_ext
 
@@ -62,8 +64,15 @@ async def probe(
     cookie_file: str = "",
     proxy: str = "",
     timeout: float = 60.0,
+    playlist: bool = False,
+    playlist_end: int = 0,
 ) -> Optional[Dict[str, Any]]:
-    """用 yt-dlp 探测页面信息，返回 info dict；失败返回 None。"""
+    """用 yt-dlp 探测页面信息，返回 info dict；失败返回 None。
+
+    ``playlist=True`` 时允许展开专辑/歌单/歌手这类集合目标——默认的
+    ``--no-playlist`` 会让 yt-dlp 只返回集合里的第一首，整张抓取就废了。
+    ``playlist_end`` 限制展开条数，避免一个巨型歌单把内存和接口拖垮。
+    """
     cmd = ytdlp_command()
     if not cmd:
         return None
@@ -71,10 +80,15 @@ async def probe(
     args = cmd + [
         "--dump-single-json",
         "--no-warnings",
-        "--no-playlist",
         "--skip-download",
         "--no-check-certificates",
+        # 网络抖动时重试一次，音乐站点更容易偶发失败
+        "--retries", "2",
     ]
+    if not playlist:
+        args.append("--no-playlist")
+    elif playlist_end > 0:
+        args += ["--playlist-end", str(playlist_end)]
     if cookies_from_browser:
         args += ["--cookies-from-browser", cookies_from_browser]
     if cookie_file:
@@ -101,16 +115,150 @@ async def probe(
         return None
 
 
-def formats_to_items(info: Dict[str, Any], page_url: str) -> List[MediaItem]:
-    """把 yt-dlp 的 formats 转成媒体条目（视频取分档，音频取最高码率）。"""
+async def probe_error(
+    url: str,
+    *,
+    cookies_from_browser: str = "",
+    cookie_file: str = "",
+    proxy: str = "",
+    timeout: float = 60.0,
+    playlist: bool = False,
+) -> str:
+    """探测失败时取回 yt-dlp 的错误信息（用于给出可诊断的提示）。
+
+    单独一个函数是因为 :func:`probe` 成功路径不该为错误信息付出代价，
+    而失败时用户恰恰最需要知道「为什么抓不到」。
+    """
+    cmd = ytdlp_command()
+    if not cmd:
+        return "未安装 yt-dlp"
+    args = cmd + ["--dump-single-json", "--no-warnings", "--skip-download",
+                  "--no-check-certificates", "--retries", "1"]
+    if not playlist:
+        args.append("--no-playlist")
+    if cookies_from_browser:
+        args += ["--cookies-from-browser", cookies_from_browser]
+    if cookie_file:
+        args += ["--cookies", cookie_file]
+    if proxy:
+        args += ["--proxy", proxy]
+    args.append(url)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, FileNotFoundError, OSError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    text = (stderr or b"").decode("utf-8", "replace").strip()
+    for line in reversed(text.splitlines()):
+        if "ERROR" in line:
+            # 去掉 "ERROR: " 前缀与多余空白，只留可读的一句
+            return re.sub(r"^ERROR:\s*", "", line).strip()[:300]
+    return text[-300:] if text else "未知错误"
+
+
+def formats_to_items(
+    info: Dict[str, Any],
+    page_url: str,
+    *,
+    platform: Optional[Any] = None,
+    quality: str = "",
+    alternatives: bool = True,
+) -> List[MediaItem]:
+    """把 yt-dlp 的 formats 转成媒体条目。
+
+    传入 ``quality`` 时走**音乐通道**：只保留纯音频轨、按音质档位排序，
+    并附带 :class:`~mediaharvest.models.MusicMeta` 供后续写标签。
+    不传则维持原有的视频优先行为。
+
+    ``alternatives=False`` 时只给出最优的一条音频流。**集合（专辑/歌单）
+    展开时必须关掉备选**：否则每首歌都会多出一条低音质条目，
+    一个 100 首的歌单会下成 200 个文件。
+
+    视频通道与音乐通道分开的原因：视频要的是「分辨率最高的合成流」，
+    音乐要的是「码率/编码最合适且**不含视频轨**的流」。用同一套逻辑选，
+    音乐会被选成体积巨大的 MV 文件。
+    """
     items: List[MediaItem] = []
     title = (info.get("title") or "").strip()
     duration = info.get("duration")
     thumbnail = info.get("thumbnail") or ""
     webpage = info.get("webpage_url") or page_url
-
-    # 视频格式：优先带音频的完整流
     formats = info.get("formats") or []
+    seen_urls: set = set()
+
+    # ---- 音乐通道 ----------------------------------------------------
+    if quality:
+        music_meta = music_mod.meta_from_info(info, platform=platform, quality=quality)
+        ranked = music_mod.sort_audio_formats(formats, music_mod.get_quality(quality))
+
+        # 只有封面、没有音频流时，也把封面作为图片给出（部分站点如此）
+        def add_audio(fmt: Dict[str, Any], is_primary: bool) -> None:
+            furl = fmt.get("url")
+            if not furl or furl in seen_urls:
+                return
+            seen_urls.add(furl)
+            ext = music_mod.format_ext(fmt)
+            label = music_mod.format_label(fmt)
+            meta = music_meta
+            if not is_primary:
+                # 备选音质不应覆盖主选，但标签内容一致
+                meta = music_meta
+            items.append(
+                MediaItem(
+                    url=furl,
+                    type=MediaType.AUDIO,
+                    source=Source.NETWORK,
+                    page_url=webpage,
+                    ext=ext,
+                    duration=duration,
+                    title=music_meta.title or title,
+                    poster=thumbnail,
+                    referer=webpage,
+                    group="ytdlp:audio",
+                    primary=is_primary,
+                    music=meta,
+                    meta={
+                        "backend": "yt-dlp",
+                        "role": "audio",
+                        "format_id": fmt.get("format_id", ""),
+                        "format_label": label,
+                        "extractor": info.get("extractor_key") or info.get("extractor", ""),
+                        "quality": quality,
+                        "lossless": music_mod.is_lossless(fmt),
+                        "abr": music_mod.format_bitrate(fmt),
+                        "acodec": fmt.get("acodec", ""),
+                    },
+                )
+            )
+
+        if ranked:
+            add_audio(ranked[0], True)
+            # 单曲场景额外给一条备选音质；集合场景不给，避免条目翻倍
+            if alternatives and len(ranked) > 1:
+                add_audio(ranked[1], False)
+
+        for th in _iter_thumbnails(info, thumbnail):
+            turl = th.get("url")
+            if not turl or turl in seen_urls:
+                continue
+            seen_urls.add(turl)
+            items.append(
+                MediaItem(
+                    url=turl, type=MediaType.IMAGE, source=Source.META,
+                    page_url=webpage, ext=url_ext(turl) or "jpg",
+                    title=music_meta.title or title, referer=webpage,
+                    width=th.get("width"), height=th.get("height"),
+                    group="ytdlp:cover", primary=(turl == thumbnail),
+                    meta={"backend": "yt-dlp", "role": "cover"},
+                )
+            )
+        return items
+
+    # ---- 视频通道（原有行为）----------------------------------------
+    # 视频格式：优先带音频的完整流
     video_candidates: List[Tuple[int, Dict[str, Any]]] = []
     audio_candidates: List[Tuple[int, Dict[str, Any]]] = []
 
@@ -145,8 +293,6 @@ def formats_to_items(info: Dict[str, Any], page_url: str) -> List[MediaItem]:
             video_candidates.append((int(height or 0) * 1000 + int(tbr or 0), fmt))
         elif has_audio:
             audio_candidates.append((int(tbr or 0), fmt))
-
-    seen_urls: set = set()
 
     def add(fmt: Dict[str, Any], mtype: MediaType, label: str) -> None:
         furl = fmt["url"]
@@ -214,12 +360,7 @@ def formats_to_items(info: Dict[str, Any], page_url: str) -> List[MediaItem]:
         add(audio_candidates[-1][1], MediaType.AUDIO, "audio")
 
     # 缩略图作为图片候选
-    thumbs = info.get("thumbnails") or []
-    if thumbnail:
-        thumbs = list(thumbs) + [{"url": thumbnail}]
-    for th in thumbs[:5]:
-        if not isinstance(th, dict):
-            continue
+    for th in _iter_thumbnails(info, thumbnail):
         turl = th.get("url")
         if not turl or turl in seen_urls:
             continue
@@ -244,6 +385,27 @@ def formats_to_items(info: Dict[str, Any], page_url: str) -> List[MediaItem]:
     return items
 
 
+def _iter_thumbnails(info: Dict[str, Any], thumbnail: str) -> List[Dict[str, Any]]:
+    """收集缩略图候选（去重、限量），封面优先。"""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    candidates = list(info.get("thumbnails") or [])
+    if thumbnail:
+        candidates.append({"url": thumbnail})
+    # 倒序：yt-dlp 的 thumbnails 一般按分辨率升序，最大的在后面
+    for th in reversed(candidates):
+        if not isinstance(th, dict):
+            continue
+        turl = th.get("url")
+        if not turl or turl in seen:
+            continue
+        seen.add(turl)
+        out.append(th)
+        if len(out) >= 3:
+            break
+    return out
+
+
 async def probe_items(
     url: str,
     *,
@@ -251,23 +413,70 @@ async def probe_items(
     cookies_from_browser: str = "",
     cookie_file: str = "",
     proxy: str = "",
+    quality: str = "",
+    playlist: bool = False,
+    playlist_end: int = 0,
 ) -> List[MediaItem]:
-    """探测并转换为媒体条目列表（失败返回空列表）。"""
+    """探测并转换为媒体条目列表（失败返回空列表）。
+
+    ``quality`` 非空即开启音乐通道；``playlist`` 允许把专辑/歌单/歌手
+    展开成多条曲目。集合展开后每一条都会带上自己的
+    :class:`~mediaharvest.models.MusicMeta`（曲目号、专辑名等）。
+    """
     info = await probe(
         url,
         cookies_from_browser=cookies_from_browser,
         cookie_file=cookie_file,
         proxy=proxy,
+        playlist=playlist,
+        playlist_end=playlist_end,
     )
     if not info:
         return []
+    platform = music_mod.platform_for(page_url or url)
     if info.get("_type") == "playlist":
         out: List[MediaItem] = []
-        for entry in (info.get("entries") or [])[:50]:
-            if isinstance(entry, dict):
-                out.extend(formats_to_items(entry, page_url or url))
+        entries = info.get("entries") or []
+        playlist_title = (info.get("title") or "").strip()
+        total = len(entries)
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            # 集合本身的信息要下沉到每一条：条目的 album 常为空（歌单尤其），
+            # 没有这一步，整张抓下来的歌会全部丢失专辑归属。
+            merged = dict(entry)
+            _inherit_collection(merged, info, playlist_title, index, total)
+            out.extend(formats_to_items(
+                merged, page_url or url, platform=platform, quality=quality,
+                alternatives=False,
+            ))
         return out
-    return formats_to_items(info, page_url or url)
+    return formats_to_items(info, page_url or url, platform=platform, quality=quality)
+
+
+def _inherit_collection(
+    entry: Dict[str, Any],
+    playlist: Dict[str, Any],
+    playlist_title: str,
+    index: int,
+    total: int,
+) -> None:
+    """把歌单/专辑级的字段补进单条 entry（就地修改）。"""
+    if entry.get("playlist_index") is None:
+        entry["playlist_index"] = index + 1
+    if entry.get("playlist_count") is None:
+        entry["playlist_count"] = total
+    if not entry.get("playlist_title") and playlist_title:
+        entry["playlist_title"] = playlist_title
+    # 专辑名为空时用集合标题兜底，这样 ID3 的 album 字段不会是空的
+    if not entry.get("album") and playlist_title:
+        entry["album"] = playlist_title
+    for key in ("album_artist", "artist", "uploader", "release_date",
+                "release_year", "genre", "thumbnail"):
+        if not entry.get(key) and playlist.get(key):
+            entry[key] = playlist[key]
+    if not entry.get("webpage_url") and playlist.get("webpage_url"):
+        entry["webpage_url"] = playlist["webpage_url"]
 
 
 # --------------------------------------------------------------------------
@@ -285,14 +494,31 @@ async def download(
     referer: str = "",
     timeout: float = 1800.0,
     progress_cb: Optional[Any] = None,
+    audio_only: bool = False,
+    fmt: str = "",
+    outtmpl: str = "",
+    extra_args: Optional[List[str]] = None,
 ) -> Tuple[bool, str, str]:
-    """用 yt-dlp 下载，返回 ``(是否成功, 落盘路径, 错误信息)``。"""
+    """用 yt-dlp 下载，返回 ``(是否成功, 落盘路径, 错误信息)``。
+
+    ``audio_only=True`` 时走音乐通道：
+
+    * **不传** ``--merge-output-format mp4``。原实现写死了这一项，会把
+      flac/mp3 硬塞进 MP4 容器，直接破坏「无损原样保存」这个前提；
+    * 不传 ``--audio-format``，保持站点原始编码，避免无 ffmpeg 时的转码
+      失败，也避免有损转有损的二次损失；
+    * 不传 ``-x``（``--extract-audio``）：调用方已经用 ``-f`` 选中了
+      **纯音频流**，再让 yt-dlp 抽轨纯属多此一举，而且 ``-x`` 会要求
+      ffmpeg —— 本项目刻意支持无 ffmpeg 环境，不能平白引入这个依赖。
+    """
     cmd = ytdlp_command()
     if not cmd:
         return False, "", "未安装 yt-dlp"
 
     os.makedirs(out_dir, exist_ok=True)
-    template = os.path.join(out_dir, "%(title).80B [%(id)s].%(ext)s")
+    template = os.path.join(out_dir, outtmpl) if outtmpl else os.path.join(
+        out_dir, "%(title).80B [%(id)s].%(ext)s"
+    )
     if filename:
         template = os.path.join(out_dir, filename)
 
@@ -300,11 +526,13 @@ async def download(
         "--no-warnings",
         "--no-playlist",
         "--no-check-certificates",
-        "--restrict-filenames" if False else "--no-restrict-filenames",
-        "--merge-output-format", "mp4",
-        "-o", template,
-        "--print", "after_move:filepath",
+        "--no-restrict-filenames",
     ]
+    if not audio_only:
+        args += ["--merge-output-format", "mp4"]
+    if fmt:
+        args += ["-f", fmt]
+    args += ["-o", template, "--print", "after_move:filepath"]
     if referer:
         args += ["--referer", referer]
     if cookies_from_browser:
@@ -313,6 +541,8 @@ async def download(
         args += ["--cookies", cookie_file]
     if proxy:
         args += ["--proxy", proxy]
+    if extra_args:
+        args += list(extra_args)
     args.append(url)
 
     try:

@@ -64,6 +64,100 @@ class Source(str, Enum):
         }.get(self.value, self.value)
 
 
+class TrackKind(str, Enum):
+    """音乐资源的粒度：单曲 / 专辑 / 歌单 / 歌手 / 电台。"""
+
+    SONG = "song"            # 单曲
+    ALBUM = "album"          # 专辑（整张）
+    PLAYLIST = "playlist"    # 歌单 / 合集
+    ARTIST = "artist"        # 歌手全部作品
+    RADIO = "radio"          # 电台 / 播客
+    MV = "mv"                # 音乐视频
+
+    @property
+    def label(self) -> str:
+        return {
+            "song": "单曲",
+            "album": "专辑",
+            "playlist": "歌单",
+            "artist": "歌手",
+            "radio": "电台",
+            "mv": "MV",
+        }.get(self.value, self.value)
+
+    @property
+    def is_collection(self) -> bool:
+        """是否为「多首」的集合型目标——需要展开成多条曲目。"""
+        return self in (TrackKind.ALBUM, TrackKind.PLAYLIST,
+                        TrackKind.ARTIST, TrackKind.RADIO)
+
+
+@dataclass
+class MusicMeta:
+    """一首曲目的音乐元信息。
+
+    与 :class:`MediaItem` 分开存放的原因：媒体条目只关心「怎么下」，
+    音乐元信息关心「下下来之后这首歌叫什么」，两者来源不同
+    （前者来自格式信息，后者来自站点的曲目信息），合并会互相污染。
+
+    这些字段最终由 :mod:`mediaharvest.tags` 写成 ID3 / MP4 / Vorbis 标签。
+    """
+
+    title: str = ""
+    artist: str = ""             # 多歌手用 " / " 连接
+    album: str = ""
+    album_artist: str = ""
+    track_number: int = 0
+    track_total: int = 0
+    disc_number: int = 0
+    disc_total: int = 0
+    year: str = ""
+    date: str = ""               # 完整日期，如 2024-05-01
+    genre: str = ""
+    isrc: str = ""
+    copyright: str = ""
+    comment: str = ""
+    lyrics: str = ""             # LRC 或纯文本
+    cover_url: str = ""          # 封面图地址，下载后嵌入标签
+    duration: Optional[float] = None
+    platform: str = ""           # 平台 key，如 netease
+    platform_name: str = ""      # 平台中文名，如 网易云音乐
+    track_id: str = ""           # 平台内的曲目 id
+    album_id: str = ""
+    kind: TrackKind = TrackKind.SONG
+
+    @property
+    def has_tags(self) -> bool:
+        """是否有值得写进文件的标签内容。"""
+        return bool(self.title or self.artist or self.album or self.lyrics)
+
+    @property
+    def display(self) -> str:
+        """``歌手 - 标题`` 形式的可读名称。"""
+        if self.artist and self.title:
+            return f"{self.artist} - {self.title}"
+        return self.title or self.artist or ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["kind"] = self.kind.value
+        data["kind_label"] = self.kind.label
+        data["display"] = self.display
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MusicMeta":
+        data = dict(data or {})
+        for drop in ("kind_label", "display"):
+            data.pop(drop, None)
+        try:
+            data["kind"] = TrackKind(data.get("kind", "song"))
+        except ValueError:
+            data["kind"] = TrackKind.SONG
+        allowed = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in data.items() if k in allowed})
+
+
 @dataclass
 class MediaItem:
     """一个待下载的媒体资源。"""
@@ -84,6 +178,8 @@ class MediaItem:
     group: str = ""          # srcset 同组标记，同组内只有 primary 默认勾选
     primary: bool = True
     referer: str = ""        # 下载该资源时应带的 Referer
+    #: 音乐元信息（仅音乐类资源有值），下载后用于写 ID3/MP4/Vorbis 标签
+    music: Optional[MusicMeta] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
     # ---- 派生属性 ----------------------------------------------------
@@ -102,6 +198,13 @@ class MediaItem:
 
     @property
     def display_name(self) -> str:
+        """可读名称：音乐条目优先用「歌手 - 歌名」。
+
+        音乐 CDN 的文件名通常是哈希（``f6344203897a...mp3``），拿它当显示名
+        在 CLI 列表和 Web 界面上毫无意义。
+        """
+        if self.music is not None and self.music.display:
+            return self.music.display
         if self.filename:
             return self.filename
         name = unquote(urlparse(self.url).path.rsplit("/", 1)[-1]) or self.host
@@ -116,20 +219,29 @@ class MediaItem:
         data["id"] = self.id
         data["host"] = self.host
         data["display_name"] = self.display_name
+        # 嵌套的音乐元信息要单独序列化（asdict 已展开，这里补上枚举与派生字段）
+        data["music"] = self.music.to_dict() if self.music else None
+        # meta 里可能存着二进制（如封面字节），JSON 序列化会直接抛异常。
+        # 在这里剔除而不是让调用方各自处理：to_dict 的契约就是「可序列化」。
+        data["meta"] = {
+            k: v for k, v in (data.get("meta") or {}).items()
+            if not isinstance(v, (bytes, bytearray, memoryview))
+        }
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MediaItem":
         data = dict(data)
-        data.pop("id", None)
-        data.pop("host", None)
-        data.pop("display_name", None)
-        data.pop("type_label", None)
-        data.pop("source_label", None)
+        for drop in ("id", "host", "display_name", "type_label", "source_label"):
+            data.pop(drop, None)
+        raw_music = data.pop("music", None)
         data["type"] = MediaType(data.get("type", "other"))
         data["source"] = Source(data.get("source", "tag"))
         allowed = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+        item = cls(**{k: v for k, v in data.items() if k in allowed})
+        if raw_music:
+            item.music = MusicMeta.from_dict(raw_music)
+        return item
 
 
 @dataclass

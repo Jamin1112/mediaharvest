@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mediaharvest"
-version = "1.0.0"
-description = "网页图片/视频爬取下载工具：支持静态页、JS 动态页、m3u8 流与主流视频平台"
+version = "1.1.0"
+description = "网页图片/视频/音乐爬取下载工具：支持静态页、JS 动态页、m3u8 流、主流视频与音乐平台"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
-keywords = ["crawler", "scraper", "image", "video", "m3u8", "hls", "downloader"]
+keywords = ["crawler", "scraper", "image", "video", "audio", "music", "m3u8", "hls", "id3", "downloader"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Internet :: WWW/HTTP",
   "Topic :: Multimedia :: Video",
+  "Topic :: Multimedia :: Sound/Audio",
 ]
 
 dependencies = [
@@ -30,6 +31,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 音乐标签写入（ID3/MP4/FLAC/Vorbis）。缺失时自动回退到内置纯 Python 实现，
+# 因此是可选的增强项，而不是硬依赖。
+music = ["mutagen>=1.45"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]

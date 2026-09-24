@@ -72,6 +72,8 @@ class Downloader:
         remux: bool = True,
         keep_ts: bool = False,
         flat: bool = False,
+        music_tags: bool = True,
+        write_lyrics_file: bool = False,
         token: Optional[CancelToken] = None,
         reporter: Optional[ProgressReporter] = None,
     ) -> None:
@@ -83,6 +85,10 @@ class Downloader:
         self.min_size = min_size
         self.flat = flat
         self.keep_ts = keep_ts
+        #: 是否给音乐文件写标签 / 歌词 / 封面
+        self.music_tags = music_tags
+        #: 是否在音频文件旁额外写一份 .lrc 歌词文件
+        self.write_lyrics_file = write_lyrics_file
         #: 取消令牌：可从其它线程触发，下载循环会实时感知
         self.token = token or CancelToken()
         #: 进度上报器：节流后回调，避免刷爆前端
@@ -108,7 +114,12 @@ class Downloader:
     # ---- 路径分配 ----------------------------------------------------
 
     def _subdir_for(self, item: MediaItem) -> str:
-        """按类型分目录（flat 模式下全部平铺）。"""
+        """按类型分目录（flat 模式下全部平铺）。
+
+        音乐条目额外按「专辑」再分一层：音乐库的目录结构本就是
+        ``歌手/专辑/曲目``，只按类型堆在 ``audio/`` 里会让整张专辑的歌
+        和零散单曲混作一团，导入播放器后无法按专辑浏览。
+        """
         if self.flat:
             return self.out_dir
         name = {
@@ -118,22 +129,59 @@ class Downloader:
             MediaType.HLS: "videos",
             MediaType.DASH: "videos",
         }.get(item.type, "others")
-        return os.path.join(self.out_dir, name)
+        base = os.path.join(self.out_dir, name)
+        if item.type == MediaType.AUDIO and item.music is not None:
+            album = sanitize_filename(item.music.album, max_len=60)
+            if album:
+                artist = sanitize_filename(item.music.album_artist or item.music.artist,
+                                           max_len=40)
+                # 专辑目录带上歌手，避免不同歌手的同名专辑（如各种「精选」）撞在一起
+                leaf = f"{artist} - {album}" if artist else album
+                return os.path.join(base, leaf)
+        return base
+
+    def _music_filename(self, item: MediaItem) -> str:
+        """音乐条目用「歌手 - 歌名」命名。
+
+        不能沿用 URL 文件名：音乐 CDN 的地址通常是
+        ``.../f6344203897a00ec561d6e1abab44c.mp3`` 这种哈希，
+        存下来满屏乱码名，音乐库根本无法识别。
+        """
+        meta = item.music
+        if meta is None:
+            return ""
+        stem = ""
+        if meta.artist and meta.title:
+            stem = f"{meta.artist} - {meta.title}"
+        elif meta.title:
+            stem = meta.title
+        elif meta.display:
+            stem = meta.display
+        if not stem:
+            return ""
+        name = sanitize_filename(stem, max_len=120)
+        return name or ""
 
     async def _allocate_path(self, item: MediaItem, ext_override: str = "") -> str:
         """分配不冲突的落盘路径。"""
         directory = self._subdir_for(item)
         os.makedirs(directory, exist_ok=True)
 
-        stem_hint = sanitize_filename(item.title) if item.title else ""
-        base = item.filename or filename_from_url(
-            item.url, fallback_stem=stem_hint or "media", default_ext=item.ext
-        )
-        base = sanitize_filename(base) or "media"
-        if ext_override:
-            base = ensure_ext(base, ext_override)
-        elif item.ext and not base.lower().endswith("." + item.ext.lower()):
-            base = ensure_ext(base, item.ext)
+        # 音乐条目优先用「歌手 - 歌名」，其余沿用原逻辑
+        base = self._music_filename(item)
+        if base:
+            audio_ext = ext_override or item.ext or ""
+            base = ensure_ext(base, audio_ext) if audio_ext else base
+        else:
+            stem_hint = sanitize_filename(item.title) if item.title else ""
+            base = item.filename or filename_from_url(
+                item.url, fallback_stem=stem_hint or "media", default_ext=item.ext
+            )
+            base = sanitize_filename(base) or "media"
+            if ext_override:
+                base = ensure_ext(base, ext_override)
+            elif item.ext and not base.lower().endswith("." + item.ext.lower()):
+                base = ensure_ext(base, item.ext)
 
         async with self._lock:
             path = os.path.join(directory, base)
@@ -162,6 +210,8 @@ class Downloader:
                 await self._download_stream(item, result)
             else:
                 await self._download_file(item, result)
+            if result.ok:
+                await self._postprocess_music(item, result)
         except CancelledError:
             result.ok = False
             result.skipped = True
@@ -170,6 +220,72 @@ class Downloader:
             result.ok = False
             result.error = f"{type(exc).__name__}: {exc}"
         return result
+
+    # ---- 音乐后处理 ------------------------------------------------
+
+    async def _postprocess_music(self, item: MediaItem, result: DownloadResult) -> None:
+        """给下载好的音乐文件写标签、歌词与封面。
+
+        放在下载成功之后而不是之前：标签写入要依赖最终落盘的文件
+        （扩展名可能已按 Content-Type 被纠正过，如 ``.mp3`` 实际是 ``.m4a``）。
+
+        写标签失败**不算下载失败**——音频本身已经拿到了，标签只是增强。
+        失败原因记进 ``item.meta``，由上层决定要不要提示用户。
+        """
+        if not self.music_tags or item.music is None or not result.path:
+            return
+        if item.type != MediaType.AUDIO:
+            return
+
+        try:
+            from .tags import TrackTags, write_tags
+        except Exception as exc:
+            item.meta["tag_error"] = f"标签模块不可用: {exc}"
+            return
+
+        meta = item.music
+        cover = item.meta.get("cover_bytes") or b""
+        tags = TrackTags(
+            title=meta.title,
+            artist=meta.artist,
+            album=meta.album,
+            album_artist=meta.album_artist,
+            track_number=meta.track_number,
+            track_total=meta.track_total,
+            disc_number=meta.disc_number,
+            disc_total=meta.disc_total,
+            year=meta.year,
+            date=meta.date,
+            genre=meta.genre,
+            comment=meta.comment,
+            isrc=meta.isrc,
+            copyright=meta.copyright,
+            lyrics=meta.lyrics,
+            cover_data=cover if isinstance(cover, (bytes, bytearray)) else b"",
+        )
+        if tags.is_empty:
+            return
+
+        loop = asyncio.get_event_loop()
+        outcome = await loop.run_in_executor(
+            None,
+            lambda: write_tags(
+                result.path, tags,
+                embed_cover=bool(cover),
+                embed_lyrics=bool(meta.lyrics),
+                write_lyrics_file=self.write_lyrics_file,
+            ),
+        )
+        item.meta["tags_written"] = outcome.written
+        item.meta["tag_backend"] = outcome.backend
+        if not outcome.ok and outcome.error:
+            item.meta["tag_error"] = outcome.error
+        # 标签写入后文件体积会变，重新统计，避免历史记录的体积对不上
+        try:
+            if os.path.exists(result.path):
+                result.size = os.path.getsize(result.path)
+        except OSError:
+            pass
 
     async def _download_stream(self, item: MediaItem, result: DownloadResult) -> None:
         """m3u8 / mpd 流媒体下载。"""

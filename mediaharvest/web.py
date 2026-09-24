@@ -265,6 +265,14 @@ def build_options(data: Dict[str, Any]) -> CrawlOptions:
         cookies_from_browser=data.get("cookies_from_browser", "") or "",
         cookie_file=data.get("cookie_file", "") or "",
         types=tuple(types),
+        # 音乐：前端未提供时沿用配置默认值（enabled/lyrics/cover 默认开）
+        music=bool(data.get("music", True)),
+        quality=data.get("quality") or "best",
+        expand_playlists=bool(data.get("expand_playlists", True)),
+        playlist_limit=max(1, int(data.get("playlist_limit") or 200)),
+        music_lyrics=bool(data.get("music_lyrics", True)),
+        music_cover=bool(data.get("music_cover", True)),
+        music_tags=bool(data.get("music_tags", True)),
     )
 
 
@@ -380,6 +388,8 @@ async def download_task(
             min_size=parse_size(dl_opts["min_size"]) if dl_opts.get("min_size") else None,
             hls_concurrency=int(dl_opts.get("hls_concurrency") or 8),
             flat=bool(dl_opts.get("flat")),
+            music_tags=bool(options.music_tags),
+            write_lyrics_file=bool(dl_opts.get("lrc_file")),
             token=token,
             reporter=reporter,
         )
@@ -916,8 +926,33 @@ summary:hover{color:var(--fg)}
             <option value="image,video" selected>图片 + 视频</option>
             <option value="image">仅图片</option>
             <option value="video,hls,dash">仅视频（含流）</option>
+            <option value="audio">仅音频 / 音乐</option>
             <option value="image,video,audio">图片 + 视频 + 音频</option>
             <option value="image,video,audio,hls,dash,segment">全部（含分片）</option>
+          </select>
+        </div>
+        <div>
+          <label>音质（音乐站点）</label>
+          <select id="quality">
+            <option value="best" selected>最高音质（无损优先）</option>
+            <option value="lossless">仅无损（没有则跳过）</option>
+            <option value="high">高音质（m4a 优先）</option>
+            <option value="medium">中等音质（约 192k）</option>
+            <option value="low">省流（约 128k）</option>
+          </select>
+        </div>
+        <div>
+          <label>专辑 / 歌单</label>
+          <select id="expand_playlists">
+            <option value="1" selected>整张抓取（展开全部曲目）</option>
+            <option value="0">只抓单个目标</option>
+          </select>
+        </div>
+        <div>
+          <label>音乐标签与歌词</label>
+          <select id="music_tags">
+            <option value="1" selected>写入标签 + 歌词 + 封面</option>
+            <option value="0">不写标签（仅保存音频）</option>
           </select>
         </div>
         <div>
@@ -1095,6 +1130,9 @@ function opts(){
     types: $('#types').value,
     render: $('#render').value,
     ytdlp: $('#ytdlp').value,
+    quality: $('#quality').value,
+    expand_playlists: $('#expand_playlists').value === '1',
+    music_tags: $('#music_tags').value === '1',
     depth: +$('#depth').value || 0,
     max_pages: +$('#max_pages').value || 1,
     link_pattern: $('#link_pattern').value.trim(),
@@ -1207,13 +1245,20 @@ function renderGrid(){
     }
     const size = i.size ? fmtSize(i.size) : '';
     const dims = (i.width && i.height) ? `${i.width}×${i.height}` : '';
+    // 音乐条目展示「歌手 - 歌名」与音质，比 URL 文件名有用得多
+    const m = i.music;
+    const name = m && m.display ? m.display : (i.display_name || i.url);
+    const bits = [size, dims].filter(Boolean);
+    if (m && m.album) bits.unshift(m.album);
+    if (i.meta && i.meta.format_label) bits.push(i.meta.format_label);
+    if (m && m.lyrics) bits.push('含歌词');
     return `<div class="tile ${sel?'sel':''}" data-id="${i.id}">
       <div class="tick">${sel?'✓':''}</div>
       <div class="tag ${i.type}">${TYPE_LABEL[i.type]||i.type}</div>
       ${thumb}
       <div class="meta">
-        <div class="nm" title="${esc(i.url)}">${esc(i.display_name||i.url)}</div>
-        <div class="sub"><span>${esc(i.source_label||'')}</span><span>${[size,dims].filter(Boolean).join(' · ')}</span></div>
+        <div class="nm" title="${esc(m && m.display ? m.display : i.url)}">${esc(name)}</div>
+        <div class="sub"><span>${esc(i.source_label||'')}</span><span>${esc(bits.join(' · '))}</span></div>
       </div>
     </div>`;
   }).join('');
@@ -1251,6 +1296,9 @@ async function download(){
   const o = opts();
   const body = {
     url: o.url, types: o.types, render: o.render, ytdlp: o.ytdlp,
+    quality: o.quality,
+    expand_playlists: o.expand_playlists,
+    music_tags: o.music_tags,
     proxy: o.proxy, cookie: o.cookie, cookies_from_browser: o.cookies_from_browser,
     items: items,
     title: $('#page-title').textContent || '',
@@ -1260,6 +1308,7 @@ async function download(){
       concurrency: +$('#concurrency').value || 8,
       hls_concurrency: +$('#concurrency').value || 8,
       max_size: $('#max_size').value.trim(),
+      lrc_file: false,
     },
   };
   $('#btn-download').disabled = true;
