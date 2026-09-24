@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
+from .control import NEVER as _NEVER
+from .control import CancelToken, CancelledError
 from .fetcher import Fetcher
 from .models import MediaItem, MediaType, Source
 
@@ -269,12 +271,15 @@ class HlsDownloader:
         max_segments: int = 20000,
         remux: bool = True,
         ffmpeg: Optional[str] = None,
+        token: Optional["CancelToken"] = None,
     ) -> None:
         self.fetcher = fetcher
         self.concurrency = max(1, concurrency)
         self.max_segments = max_segments
         self.remux = remux
         self.ffmpeg = ffmpeg if ffmpeg is not None else find_ffmpeg()
+        #: 取消令牌；缺省时用「永不取消」，保持向后兼容
+        self.token = token if token is not None else _NEVER
         self._key_cache: Dict[str, bytes] = {}
 
     async def download(
@@ -361,11 +366,16 @@ class HlsDownloader:
 
         async def one(index: int, seg: Segment) -> None:
             nonlocal done
+            # 取消后不再发起新分片请求（已在途的会自然结束）
+            if self.token.cancelled:
+                return
             async with sem:
-                if errors:
+                if errors or self.token.cancelled:
                     return
                 try:
                     data = await self._fetch_segment(seg, referer)
+                except CancelledError:
+                    return
                 except Exception as exc:
                     async with lock:
                         errors.append(f"分片 {index} 失败: {exc}")
@@ -378,6 +388,9 @@ class HlsDownloader:
 
         await asyncio.gather(*(one(i, s) for i, s in enumerate(segments)))
 
+        # 取消优先于错误：用户主动取消时不该报「分片失败」
+        if self.token.cancelled:
+            raise CancelledError(self.token.reason or "用户取消")
         if errors:
             raise RuntimeError(errors[0])
 

@@ -14,6 +14,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import httpx
 
+from .control import (
+    CancelToken,
+    CancelledError,
+    ProgressReporter,
+    _interruptible_sleep,
+)
 from .fetcher import Fetcher
 from .hls import HlsDownloader, find_ffmpeg, remux_to_mp4
 from .models import DownloadResult, MediaItem, MediaType
@@ -66,6 +72,8 @@ class Downloader:
         remux: bool = True,
         keep_ts: bool = False,
         flat: bool = False,
+        token: Optional[CancelToken] = None,
+        reporter: Optional[ProgressReporter] = None,
     ) -> None:
         self.fetcher = fetcher
         self.out_dir = out_dir
@@ -75,6 +83,10 @@ class Downloader:
         self.min_size = min_size
         self.flat = flat
         self.keep_ts = keep_ts
+        #: 取消令牌：可从其它线程触发，下载循环会实时感知
+        self.token = token or CancelToken()
+        #: 进度上报器：节流后回调，避免刷爆前端
+        self.reporter = reporter or ProgressReporter()
         self.ffmpeg = find_ffmpeg()
         self.has_remux = _remux_available()
         self.hls = HlsDownloader(
@@ -83,9 +95,15 @@ class Downloader:
             max_segments=max_segments,
             remux=remux,
             ffmpeg=self.ffmpeg,
+            token=self.token,
         )
         self._used_paths: Set[str] = set()
         self._lock = asyncio.Lock()
+
+    @property
+    def progress(self) -> ProgressReporter:
+        """当前进度上报器。"""
+        return self.reporter
 
     # ---- 路径分配 ----------------------------------------------------
 
@@ -144,6 +162,10 @@ class Downloader:
                 await self._download_stream(item, result)
             else:
                 await self._download_file(item, result)
+        except CancelledError:
+            result.ok = False
+            result.skipped = True
+            result.error = "已取消"
         except Exception as exc:
             result.ok = False
             result.error = f"{type(exc).__name__}: {exc}"
@@ -166,8 +188,16 @@ class Downloader:
         if path.lower().endswith(".mp4"):
             ts_path = os.path.splitext(path)[0] + ".ts"
 
+        self.progress.set_phase("downloading", "拉取视频分片")
+
         def progress(_kind: str, done: int, total: int) -> None:
             item.meta["progress"] = (done, total)
+            # 分片进度映射到当前文件的百分比，让进度条能动起来
+            self.progress.set_phase("downloading", f"分片 {done}/{total}")
+            if total > 0:
+                self.progress.state.bytes_total = total
+                self.progress.state.bytes_done = done
+                self.progress.emit()
 
         await self.hls.download(
             item.url, ts_path, referer=item.referer or item.page_url, progress=progress
@@ -180,6 +210,7 @@ class Downloader:
 
         final = ts_path
         if path.lower().endswith(".mp4"):
+            self.progress.set_phase("remuxing", "转封装为 MP4")
             final = await self._remux_ts(ts_path, path)
 
         result.ok = True
@@ -263,7 +294,7 @@ class Downloader:
         """普通文件下载，支持流式写入与大小限制。
 
         自带指数退避重试：429/5xx 与网络抖动都会重试，这对图片 CDN 很关键
-        （不少站点会对并发请求返回 429）。
+        （不少站点会对并发请求返回 429）。取消后立即停止，不再重试。
         """
         path = await self._allocate_path(item)
         url = item.url
@@ -272,14 +303,15 @@ class Downloader:
         attempts = max(0, self.fetcher.retries)
         last_error = ""
         for attempt in range(attempts + 1):
+            self.token.check()
             outcome = await self._attempt_download(url, path, referer, item, result)
             if outcome is None:
                 return  # 成功，或无需重试的终态
             last_error = outcome
             if attempt < attempts:
-                # 429 需要等更久，避免越试越被限流
+                # 429 需要等更久，避免越试越被限流；等待期间也要能被取消
                 delay = 1.5 * (attempt + 1) if "429" in outcome else 0.6 * (attempt + 1)
-                await asyncio.sleep(delay)
+                await _interruptible_sleep(delay, self.token)
 
         result.ok = False
         result.error = last_error or "下载失败"
@@ -311,6 +343,7 @@ class Downloader:
                 clen = resp.headers.get("content-length") or ""
                 if clen.isdigit():
                     item.size = int(clen)
+                    self.progress.set_total(int(clen))
 
                 # 大文件提前拒绝，避免浪费时间
                 if self.max_size and item.size and item.size > self.max_size:
@@ -320,10 +353,16 @@ class Downloader:
 
                 with open(tmp_path, "wb") as fh:
                     async for chunk in resp.aiter_bytes(65536):
+                        # 每个分块都检查取消 —— 这是「大文件能立即取消」的关键
+                        if self.token.cancelled:
+                            fh.close()
+                            _silent_remove(tmp_path)
+                            raise CancelledError(self.token.reason or "用户取消")
                         if not chunk:
                             continue
                         fh.write(chunk)
                         size += len(chunk)
+                        self.progress.add_bytes(len(chunk))
                         if self.max_size and size > self.max_size:
                             result.skipped = True
                             result.error = f"超过体积上限 ({human_size(self.max_size)})"
@@ -382,10 +421,22 @@ class Downloader:
         *,
         progress: Optional[ProgressFn] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        on_start: Optional[Callable[[int, MediaItem], None]] = None,
     ) -> List[DownloadResult]:
-        """并发下载多条资源，保持输入顺序返回结果。"""
+        """并发下载多条资源，保持输入顺序返回结果。
+
+        ``should_stop`` 是历史遗留的轻量钩子（在文件开始前检查一次）；
+        真正能打断大文件的是 ``self.token``。这里把两者桥接起来：
+        ``should_stop()`` 返回真时也会触发 ``token.cancel()``，
+        保证调用方无论用哪种方式都能取消。
+        """
+        # 桥接外部停止钩子到取消令牌
+        if should_stop is not None and not self.token.cancelled and should_stop():
+            self.token.cancel()
+
         sem = asyncio.Semaphore(self.concurrency)
         results: List[Optional[DownloadResult]] = [None] * len(items)
+        self.progress.state.total_files = len(items)
 
         # 去重：同一 URL 只下一次
         seen: Dict[str, int] = {}
@@ -394,6 +445,7 @@ class Downloader:
             if item.url in seen:
                 dup = DownloadResult(item=item, skipped=True, error="重复地址，已跳过")
                 results[idx] = dup
+                self.progress.finish_file(ok=False, skipped=True)
                 if progress:
                     progress(dup)
                 continue
@@ -402,15 +454,32 @@ class Downloader:
 
         async def worker(idx: int, item: MediaItem) -> None:
             async with sem:
-                if should_stop and should_stop():
-                    results[idx] = DownloadResult(item=item, skipped=True, error="已取消")
+                # 开始前检查：已取消就不再发请求
+                if self.token.cancelled or (should_stop and should_stop()):
+                    self.token.cancel()
+                    results[idx] = DownloadResult(
+                        item=item, skipped=True, error="已取消"
+                    )
+                    self.progress.finish_file(ok=False, skipped=True)
                     return
+
+                self.progress.start_file(idx + 1, item.display_name, item.size)
+                if on_start:
+                    try:
+                        on_start(idx, item)
+                    except Exception:
+                        pass
+
                 res = await self.download_one(item)
                 results[idx] = res
+                self.progress.finish_file(
+                    ok=res.ok, size=res.size, skipped=res.skipped
+                )
                 if progress:
                     progress(res)
 
         await asyncio.gather(*(worker(i, it) for i, it in unique))
+        self.progress.flush()
         return [r for r in results if r is not None]
 
 

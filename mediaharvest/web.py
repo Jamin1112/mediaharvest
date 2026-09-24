@@ -43,10 +43,12 @@ from .config import (
     load_config,
     save_config,
 )
+from .control import CancelToken, Progress, ProgressReporter
 from .crawler import CrawlOptions, Crawler
 from .downloader import Downloader
 from .hls import find_ffmpeg
 from .models import DownloadResult, MediaItem, MediaType
+from .session import HistoryEntry, HistoryStore, session_dir
 from .utils import human_size, parse_size
 
 # --------------------------------------------------------------------------
@@ -82,6 +84,12 @@ class Job:
     bytes_total: int = 0
     out_dir: str = ""
 
+    #: 实时进度快照（由 ProgressReporter 更新）
+    live: Dict[str, Any] = field(default_factory=dict)
+    #: 历史记录条目 id（用于在历史面板里取消）
+    history_id: str = ""
+    #: 关联的取消令牌；由下载任务写入，取消接口从别的线程触发
+    token: Any = None
     cancel: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -106,6 +114,10 @@ class Job:
             "bytes_total": self.bytes_total,
             "bytes_human": human_size(self.bytes_total),
             "out_dir": self.out_dir,
+            "dir_name": os.path.basename(self.out_dir.rstrip("/")) if self.out_dir else "",
+            "live": self.live,
+            "history_id": self.history_id,
+            "cancellable": self.status in ("pending", "running"),
         }
 
 
@@ -114,6 +126,9 @@ class JobRunner:
 
     def __init__(self) -> None:
         self.jobs: Dict[str, Job] = {}
+        #: 历史记录里 id → 取消令牌，供「历史面板取消」使用
+        self.tokens: Dict[str, Any] = {}
+        self.history = HistoryStore()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -144,6 +159,11 @@ class JobRunner:
                 job.status = "error"
                 job.error = f"{type(exc).__name__}: {exc}"
             finally:
+                # 任务结束后释放令牌引用，避免无限增长
+                if job.history_id:
+                    self.tokens.pop(job.history_id, None)
+                if job.token is not None:
+                    job.token = None
                 self._queue.task_done()
 
     def submit(self, job: Job, coro_factory: Any) -> Job:
@@ -158,11 +178,51 @@ class JobRunner:
         return self.jobs.get(job_id)
 
     def cancel(self, job_id: str) -> bool:
+        """取消一个任务。
+
+        真正生效的是 ``token.cancel()``——它能让下载循环（包括正在传输的
+        大文件）立刻停下，而不只是等下一个文件才开始跳过。
+        """
         job = self.jobs.get(job_id)
         if not job:
             return False
         job.cancel = True
+        if job.token is not None:
+            job.token.cancel("用户取消")
         return True
+
+    def cancel_history(self, history_id: str) -> bool:
+        """从历史记录取消一个仍在进行的下载。"""
+        token = self.tokens.get(history_id)
+        if token is None:
+            # 令牌可能已随任务结束释放；同时检查历史条目状态
+            entry = self.history.get(history_id)
+            return bool(entry and entry.status != "running" and False)
+        token.cancel("用户从历史取消")
+        return True
+
+    def register_token(self, history_id: str, token: Any) -> None:
+        with self._lock:
+            self.tokens[history_id] = token
+
+    def jobs_snapshot(self) -> List[Dict[str, Any]]:
+        """所有任务的简要状态，供历史面板显示进行中的下载。"""
+        with self._lock:
+            jobs = list(self.jobs.values())
+        out = []
+        for job in jobs[-50:]:
+            if job.kind != "download":
+                continue
+            out.append({
+                "job_id": job.id,
+                "history_id": job.history_id,
+                "status": job.status,
+                "title": job.title,
+                "out_dir": job.out_dir,
+                "live": job.live,
+                "cancellable": job.status in ("pending", "running"),
+            })
+        return out
 
 
 RUNNER = JobRunner()
@@ -227,9 +287,21 @@ async def crawl_task(job: Job, options: CrawlOptions) -> None:
         job.message = f"发现 {len(report.items)} 个资源"
 
 
-async def download_task(job: Job, options: CrawlOptions, urls: List[Dict[str, Any]], out_dir: str,
-                        dl_opts: Dict[str, Any]) -> None:
-    """下载前端勾选的资源。"""
+async def download_task(
+    job: Job,
+    options: CrawlOptions,
+    urls: List[Dict[str, Any]],
+    out_dir: str,
+    dl_opts: Dict[str, Any],
+    title: str = "",
+    page_url: str = "",
+    use_session_dir: bool = True,
+) -> None:
+    """下载前端勾选的资源。
+
+    每次下载都会创建一个**时间戳会话目录**，本次文件都放在里面；
+    同时把这次下载登记到历史记录，并接上取消令牌与实时进度上报。
+    """
     # 重建 MediaItem（前端回传的是 to_dict 的结果）
     wanted: List[MediaItem] = []
     for raw in urls:
@@ -245,22 +317,75 @@ async def download_task(job: Job, options: CrawlOptions, urls: List[Dict[str, An
         return
 
     job.total = len(wanted)
-    job.out_dir = os.path.abspath(out_dir)
+    # 会话标题的取值优先级：显式标题 → 资源自带标题 → 网页域名 → 兜底
+    fallback_title = ""
+    if wanted and wanted[0].title:
+        fallback_title = wanted[0].title
+    elif page_url:
+        try:
+            from urllib.parse import urlsplit
+
+            fallback_title = urlsplit(page_url).netloc or page_url
+        except ValueError:
+            fallback_title = page_url
+    job.title = (title or fallback_title or "下载").strip()[:80]
+    job.url = page_url
+
+    # 时间戳会话目录：每次下载独立存放，互不覆盖
+    base_dir = os.path.abspath(out_dir)
+    if use_session_dir:
+        target_dir = session_dir(base_dir, job.title)
+    else:
+        target_dir = base_dir
+        os.makedirs(target_dir, exist_ok=True)
+    job.out_dir = target_dir
+
+    # 登记历史
+    entry = HistoryEntry(
+        id=job.id,
+        created=time.time(),
+        title=job.title,
+        page_url=page_url,
+        out_dir=target_dir,
+        status="running",
+        total=len(wanted),
+    )
+    job.history_id = entry.id
+    RUNNER.history.add(entry)
+
+    # 取消令牌 + 进度上报
+    token = CancelToken()
+    job.token = token
+    RUNNER.register_token(entry.id, token)
+
+    def on_progress(p: Progress) -> None:
+        job.live = p.to_dict()
+        job.progress = f"{p.files_done}/{p.total_files}"
+        # 把进行中的状态写回历史，历史面板据此显示进度
+        RUNNER.history.update(
+            entry.id,
+            ok=p.ok, failed=p.failed, skipped=p.skipped,
+            bytes_total=int(p.bytes_finished),
+        )
+
+    reporter = ProgressReporter(on_progress, interval=0.2)
 
     async with Crawler(options) as crawler:
         downloader = Downloader(
             crawler.fetcher,
-            out_dir=out_dir,
+            out_dir=target_dir,
             concurrency=int(dl_opts.get("concurrency") or 8),
             overwrite=bool(dl_opts.get("overwrite")),
             max_size=parse_size(dl_opts["max_size"]) if dl_opts.get("max_size") else None,
             min_size=parse_size(dl_opts["min_size"]) if dl_opts.get("min_size") else None,
             hls_concurrency=int(dl_opts.get("hls_concurrency") or 8),
             flat=bool(dl_opts.get("flat")),
+            token=token,
+            reporter=reporter,
         )
 
         def on_result(result: DownloadResult) -> None:
-            job.done += 1
+            # 累加统计：进度条与历史都依赖这几个计数
             if result.ok:
                 job.ok += 1
                 job.bytes_total += result.size
@@ -268,18 +393,30 @@ async def download_task(job: Job, options: CrawlOptions, urls: List[Dict[str, An
                 job.skipped += 1
             else:
                 job.failed += 1
-            job.progress = f"{job.done}/{job.total}"
             job.results.append(result.to_dict())
+            RUNNER.history.append_file(entry.id, result.to_dict())
 
         await downloader.download_many(
             wanted, progress=on_result, should_stop=lambda: job.cancel
         )
 
-    if job.cancel:
+    # 收尾：写回历史最终状态
+    if token.cancelled:
         job.status = "cancelled"
-        job.message = "已取消"
+        job.message = f"已取消（完成 {job.ok} 项）"
     else:
         job.message = f"成功 {job.ok}，失败 {job.failed}，跳过 {job.skipped}"
+
+    RUNNER.history.update(
+        entry.id,
+        status=job.status if job.status != "running" else "done",
+        ok=job.ok, failed=job.failed, skipped=job.skipped,
+        bytes_total=job.bytes_total,
+        message=job.message,
+        finished=time.time(),
+        out_dir=target_dir,
+    )
+    job.live = {}  # 结束后不再显示实时进度
 
 
 # --------------------------------------------------------------------------
@@ -407,8 +544,88 @@ def api_download() -> Response:
     out_dir = effective_out_dir((data.get("out_dir") or "").strip(), config_dir())
     dl_opts = data.get("download") or {}
     job = Job(id=uuid.uuid4().hex[:12], kind="download", url=data.get("url", ""))
-    RUNNER.submit(job, lambda j: download_task(j, options, items, out_dir, dl_opts))
-    return jsonify({"job": job.id})
+    RUNNER.submit(
+        job,
+        lambda j: download_task(
+            j, options, items, out_dir, dl_opts,
+            title=(data.get("title") or "").strip(),
+            page_url=(data.get("url") or "").strip(),
+            use_session_dir=bool(data.get("session_dir", True)),
+        ),
+    )
+    return jsonify({"job": job.id, "out_dir": out_dir})
+
+
+@app.route("/api/history")
+def api_history() -> Response:
+    """下载历史列表（含仍在进行的会话）。"""
+    entries = [e.to_dict() for e in RUNNER.history.list(limit=100)]
+    # 把进行中任务的实时进度合并进来，历史面板才能显示进度条与取消按钮
+    live = {j["history_id"]: j for j in RUNNER.jobs_snapshot() if j.get("history_id")}
+    for entry in entries:
+        active = live.get(entry["id"])
+        if active:
+            entry["live"] = active.get("live") or {}
+            entry["running"] = True
+            entry["cancellable"] = active.get("cancellable", False)
+            entry["job_id"] = active.get("job_id")
+        else:
+            entry["cancellable"] = False
+    return jsonify({"entries": entries, "base_dir": effective_out_dir(explicit_config=config_dir())})
+
+
+@app.route("/api/history/<entry_id>/cancel", methods=["POST"])
+def api_history_cancel(entry_id: str) -> Response:
+    """从历史面板取消一个仍在进行的下载。"""
+    # 先按历史 id 找令牌
+    if RUNNER.cancel_history(entry_id):
+        return jsonify({"ok": True, "message": "已发送取消请求"})
+    # 兜底：按 job id 找
+    if RUNNER.cancel(entry_id):
+        return jsonify({"ok": True, "message": "已发送取消请求"})
+    return jsonify({"error": "该任务已结束或不存在"}), 404
+
+
+@app.route("/api/history/<entry_id>", methods=["DELETE"])
+def api_history_delete(entry_id: str) -> Response:
+    """删除一条历史记录（不删除已下载的文件）。"""
+    ok = RUNNER.history.remove(entry_id)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/history", methods=["DELETE"])
+def api_history_clear() -> Response:
+    """清空历史记录（不删除已下载的文件）。"""
+    count = RUNNER.history.clear()
+    return jsonify({"ok": True, "removed": count})
+
+
+@app.route("/api/history/<entry_id>/open", methods=["POST"])
+def api_history_open(entry_id: str) -> Response:
+    """在 Finder 里打开该次下载的目录。"""
+    entry = RUNNER.history.get(entry_id)
+    if not entry or not entry.out_dir:
+        return jsonify({"error": "记录不存在"}), 404
+    if not os.path.isdir(entry.out_dir):
+        return jsonify({"error": f"目录不存在: {entry.out_dir}"}), 404
+    try:
+        _open_in_file_manager(entry.out_dir)
+    except Exception as exc:
+        return jsonify({"error": f"打开失败: {exc}"}), 500
+    return jsonify({"ok": True, "path": entry.out_dir})
+
+
+def _open_in_file_manager(path: str) -> None:
+    """在系统文件管理器里打开目录（跨平台，失败不影响主流程）。"""
+    import subprocess
+    import sys as _sys
+
+    if _sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    elif _sys.platform.startswith("win"):  # pragma: no cover
+        os.startfile(path)  # type: ignore[attr-defined]
+    else:  # pragma: no cover
+        subprocess.Popen(["xdg-open", path])
 
 
 @app.route("/api/job/<job_id>")
@@ -602,6 +819,49 @@ summary:hover{color:var(--fg)}
 .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:8px}
 .bar>i{display:block;height:100%;background:linear-gradient(90deg,#2f81f7,#3fb950);
   width:0;transition:width .25s}
+/* 下载进度面板 */
+.dlpanel{background:var(--panel2);border:1px solid var(--border);border-radius:9px;
+  padding:13px 15px;margin-bottom:14px}
+.dlpanel .row1{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  flex-wrap:wrap;margin-bottom:9px}
+.dlpanel .fname{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;flex:1;min-width:0}
+.dlpanel .nums{font-size:12px;color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.dlpanel .pbar{height:9px;background:#0b0f14;border-radius:5px;overflow:hidden;position:relative}
+.dlpanel .pbar>i{display:block;height:100%;background:linear-gradient(90deg,#2f81f7,#3fb950);
+  width:0;transition:width .18s ease-out}
+/* 大小未知时的流动条纹 */
+.dlpanel .pbar.unknown>i{width:100%!important;opacity:.5;
+  background:repeating-linear-gradient(45deg,#2f81f7 0 10px,#1f6feb 10px 20px);
+  animation:slide 1s linear infinite}
+@keyframes slide{to{background-position:28px 0}}
+.dlpanel .meta2{display:flex;justify-content:space-between;gap:10px;margin-top:7px;
+  font-size:11px;color:var(--dim);flex-wrap:wrap}
+.btn-mini{padding:3px 10px;font-size:11px;border-radius:6px}
+/* 历史面板 */
+.hist-item{background:var(--panel2);border:1px solid var(--border);border-radius:9px;
+  padding:12px 14px;margin-bottom:10px;transition:.15s}
+.hist-item:hover{border-color:#484f58}
+.hist-item.running{border-color:#1f6feb88;background:#1f6feb11}
+.hist-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;
+  flex-wrap:wrap}
+.hist-title{font-size:13px;font-weight:600;margin-bottom:4px;word-break:break-all}
+.hist-meta{font-size:11px;color:var(--dim);display:flex;gap:12px;flex-wrap:wrap}
+.hist-actions{display:flex;gap:7px;align-items:center;flex-shrink:0}
+.pill{font-size:10px;padding:2px 9px;border-radius:10px;font-weight:600;white-space:nowrap}
+.pill.run{background:#1f6feb33;color:#79c0ff}
+.pill.done{background:#23863633;color:#56d364}
+.pill.cancel{background:#8b949e33;color:#c9d1d9}
+.pill.error{background:#f8514933;color:#ff7b72}
+.hist-files{margin-top:9px;font-size:11px;color:var(--dim);max-height:150px;
+  overflow-y:auto;font-family:ui-monospace,Menlo,monospace;line-height:1.7}
+.hist-files .f-ok{color:#56d364}.hist-files .f-bad{color:#ff7b72}
+.tabs{display:flex;gap:6px;margin-bottom:16px;border-bottom:1px solid var(--border)}
+.tab{padding:8px 16px;cursor:pointer;font-size:13px;border-bottom:2px solid transparent;
+  color:var(--dim);transition:.15s;user-select:none}
+.tab:hover{color:var(--fg)}
+.tab.active{color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
+.tab .cnt{font-size:10px;opacity:.7;margin-left:5px}
 .empty{text-align:center;padding:44px 20px;color:var(--dim)}
 .empty .big{font-size:34px;margin-bottom:10px;opacity:.5}
 .footbar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);
@@ -627,6 +887,13 @@ summary:hover{color:var(--fg)}
 </header>
 
 <main>
+  <!-- 标签页 -->
+  <div class="tabs">
+    <div class="tab active" data-view="download">抓取下载</div>
+    <div class="tab" data-view="history">下载历史<span class="cnt" id="tab-hist-cnt"></span></div>
+  </div>
+
+  <div id="view-download">
   <!-- 输入区 -->
   <div class="card">
     <label>目标网址（支持任意网页，或直接粘贴图片/视频/m3u8 地址）</label>
@@ -748,6 +1015,23 @@ summary:hover{color:var(--fg)}
       支持：普通网页图片 · 动态加载内容 · 视频直链 · m3u8 流 · 抖音/B站/YouTube 等平台
     </div>
   </div>
+  </div><!-- /view-download -->
+
+  <!-- 下载历史 -->
+  <div class="hidden" id="view-history">
+    <div style="display:flex;justify-content:space-between;align-items:center;
+                gap:12px;flex-wrap:wrap">
+      <div>
+        <div style="font-weight:600">下载历史</div>
+        <div class="hint" style="margin:0" id="hist-base"></div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="sm" id="btn-hist-refresh">刷新</button>
+        <button class="sm danger" id="btn-hist-clear">清空历史</button>
+      </div>
+    </div>
+    <div id="hist-list" style="margin-top:14px"></div>
+  </div>
 </main>
 
 <!-- 底部操作栏 -->
@@ -763,7 +1047,8 @@ summary:hover{color:var(--fg)}
 
 <script>
 const $ = s => document.querySelector(s);
-const state = {items:[], selected:new Set(), filter:'all', crawlJob:null, dlJob:null, timer:null};
+const state = {items:[], selected:new Set(), filter:'all', crawlJob:null, dlJob:null,
+               timer:null, histTimer:null, history:[]};
 
 // ---------- 环境状态 ----------
 async function loadStatus(){
@@ -968,7 +1253,9 @@ async function download(){
     url: o.url, types: o.types, render: o.render, ytdlp: o.ytdlp,
     proxy: o.proxy, cookie: o.cookie, cookies_from_browser: o.cookies_from_browser,
     items: items,
+    title: $('#page-title').textContent || '',
     out_dir: $('#out_dir').value.trim() || 'downloads',
+    session_dir: true,
     download: {
       concurrency: +$('#concurrency').value || 8,
       hls_concurrency: +$('#concurrency').value || 8,
@@ -978,8 +1265,10 @@ async function download(){
   $('#btn-download').disabled = true;
   $('#btn-download').innerHTML = '<span class="spin"></span> 下载中…';
   $('#btn-cancel').classList.remove('hidden');
+  $('#btn-cancel').disabled = false;
   $('#dl-status').textContent = '';
   $('#bar-fill').style.width = '0%';
+  showDlPanel('准备中…', 0);
 
   try{
     const res = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -990,8 +1279,64 @@ async function download(){
     pollDownload();
   }catch(e){
     $('#dl-status').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    hideDlPanel();
     resetDlBtn();
   }
+}
+
+// ---------- 下载进度面板 ----------
+function showDlPanel(name, pct, opts){
+  opts = opts || {};
+  let el = $('#dl-panel');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'dl-panel';
+    el.className = 'dlpanel';
+    const grid = $('#media-grid');
+    grid.parentNode.insertBefore(el, grid);
+  }
+  el.innerHTML = `
+    <div class="row1">
+      <div class="fname" title="${esc(name)}">${esc(name)}</div>
+      <div class="nums" id="dl-numbers"></div>
+    </div>
+    <div class="pbar ${opts.unknown?'unknown':''}"><i style="width:${pct||0}%"></i></div>
+    <div class="meta2">
+      <span id="dl-phase">${esc(opts.phase||'')}</span>
+      <span id="dl-detail">${esc(opts.detail||'')}</span>
+    </div>`;
+}
+
+function updateDlPanel(live){
+  const el = $('#dl-panel');
+  if(!el || !live || !live.total_files) return;
+  const pct = live.overall_percent || 0;
+  const unknown = !live.bytes_total;
+  const bar = el.querySelector('.pbar');
+  const fill = el.querySelector('.pbar > i');
+  bar.classList.toggle('unknown', unknown);
+  fill.style.width = pct + '%';
+
+  const fp = live.file_percent;
+  el.querySelector('.fname').textContent = live.name || '';
+  el.querySelector('.fname').title = live.name || '';
+  $('#dl-numbers').innerHTML =
+    `<b style="color:var(--fg)">${pct.toFixed(0)}%</b>` +
+    (fp !== null && fp !== undefined ? ` · 当前 ${fp.toFixed(0)}%` : '') +
+    ` · ${live.files_done}/${live.total_files} 个`;
+  const phaseText = {downloading:'下载中', remuxing:'转封装中', finishing:'收尾中'}[live.phase] || live.phase;
+  $('#dl-phase').textContent = phaseText;
+  const parts = [];
+  if(live.bytes_total) parts.push(`${fmtSize(live.bytes_done)} / ${fmtSize(live.bytes_total)}`);
+  if(live.ok) parts.push(`成功 ${live.ok}`);
+  if(live.failed) parts.push(`失败 ${live.failed}`);
+  if(live.detail) parts.push(live.detail);
+  $('#dl-detail').textContent = parts.join(' · ');
+}
+
+function hideDlPanel(){
+  const el = $('#dl-panel');
+  if(el) el.remove();
 }
 
 function pollDownload(){
@@ -999,21 +1344,50 @@ function pollDownload(){
   state.timer = setInterval(async () => {
     try{
       const j = await (await fetch('/api/job/' + state.dlJob)).json();
-      const pct = j.total ? Math.round(j.done / j.total * 100) : 0;
+      const live = j.live || {};
+      const pct = live.overall_percent !== undefined ? live.overall_percent
+                  : (j.total ? j.done / j.total * 100 : 0);
       $('#bar-fill').style.width = pct + '%';
-      $('#dl-status').textContent = `${j.done}/${j.total} · 成功 ${j.ok} · 失败 ${j.failed}` + (j.bytes_human && j.bytes_total ? ` · ${j.bytes_human}` : '');
+      if(live.total_files) updateDlPanel(live);
+      else if(j.status === 'running') showDlPanel('准备中…', pct);
+
+      $('#dl-status').textContent =
+        `${j.ok||0} 成功` + (j.failed?` · ${j.failed} 失败`:'') +
+        (j.bytes_total?` · ${j.bytes_human}`:'');
+
       if(j.status === 'running' || j.status === 'pending') return;
+      // 结束
       clearInterval(state.timer);
+      hideDlPanel();
       resetDlBtn();
       $('#btn-cancel').classList.add('hidden');
-      if(j.status === 'done' || j.status === 'cancelled'){
+      if(j.status === 'done'){
         $('#dl-status').innerHTML = `<span style="color:var(--green)">✓ ${esc(j.message||'完成')}</span>`;
         showFailures(j);
+        loadHistory();
+      } else if(j.status === 'cancelled'){
+        $('#dl-status').innerHTML = `<span style="color:var(--yellow)">⊘ ${esc(j.message||'已取消')}</span>`;
+        loadHistory();
       } else {
         $('#dl-status').innerHTML = `<span class="err">${esc(j.error||'失败')}</span>`;
       }
-    }catch(e){ clearInterval(state.timer); resetDlBtn(); }
-  }, 600);
+      if(j.out_dir) addOutDirHint(j.out_dir);
+    }catch(e){ clearInterval(state.timer); hideDlPanel(); resetDlBtn(); }
+  }, 400);
+}
+
+function addOutDirHint(dir){
+  const el = $('#dl-status');
+  const old = $('#out-dir-hint');
+  if(old) old.remove();
+  const span = document.createElement('span');
+  span.id = 'out-dir-hint';
+  span.className = 'hint';
+  span.style.marginLeft = '10px';
+  span.textContent = `→ ${dir}`;
+  span.title = dir;
+  el.parentNode.appendChild(span);
+  setTimeout(() => span.remove(), 15000);
 }
 
 function showFailures(j){
@@ -1043,12 +1417,156 @@ function esc(s){
   return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// ---------- 下载历史 ----------
+async function loadHistory(){
+  try{
+    const res = await fetch('/api/history');
+    const data = await res.json();
+    state.history = data.entries || [];
+    $('#hist-base').textContent = data.base_dir ? '保存位置：' + data.base_dir : '';
+    renderHistory();
+    const running = state.history.filter(e => e.running).length;
+    $('#tab-hist-cnt').textContent = state.history.length
+      ? (running ? ` (${running} 进行中)` : ` (${state.history.length})`) : '';
+  }catch(e){ console.error(e); }
+}
+
+const STATUS_META = {
+  running:   {cls:'run',    text:'进行中'},
+  done:      {cls:'done',   text:'已完成'},
+  cancelled: {cls:'cancel', text:'已取消'},
+  error:     {cls:'error',  text:'失败'},
+};
+
+function renderHistory(){
+  const list = state.history;
+  if(!list.length){
+    $('#hist-list').innerHTML = '<div class="empty" style="padding:30px">还没有下载记录</div>';
+    return;
+  }
+  $('#hist-list').innerHTML = list.map(e => {
+    const meta = STATUS_META[e.status] || STATUS_META.done;
+    const okFiles = (e.files||[]).filter(f => f.ok).length;
+    const badFiles = (e.files||[]).filter(f => !f.ok && !f.skipped).length;
+    const live = e.live || {};
+    const pct = live.overall_percent;
+
+    return `<div class="hist-item ${e.running?'running':''}" data-id="${e.id}">
+      <div class="hist-head">
+        <div style="flex:1;min-width:0">
+          <div class="hist-title">${esc(e.title || e.dir_name || '(未命名)')}</div>
+          <div class="hist-meta">
+            <span>${esc(e.created_text)}</span>
+            ${e.duration!=null?`<span>耗时 ${e.duration.toFixed(1)}s</span>`:''}
+            <span>${e.ok||0} 成功${e.failed?` · ${e.failed} 失败`:''}${e.skipped?` · ${e.skipped} 跳过`:''}</span>
+            ${e.bytes_total?`<span>${fmtSize(e.bytes_total)}</span>`:''}
+          </div>
+          <div class="hist-meta" style="margin-top:4px">
+            <span title="${esc(e.out_dir)}">📁 ${esc(e.dir_name || e.out_dir)}</span>
+          </div>
+        </div>
+        <div class="hist-actions">
+          <span class="pill ${meta.cls}">${meta.text}</span>
+          ${e.running && e.cancellable
+            ? `<button class="sm danger btn-mini btn-hist-cancel" data-id="${e.id}">取消</button>` : ''}
+          <button class="sm btn-mini btn-hist-open" data-id="${e.id}">打开目录</button>
+          <button class="sm btn-mini btn-hist-del" data-id="${e.id}">删除</button>
+        </div>
+      </div>
+      ${e.running && pct!==undefined ? `
+        <div class="pbar ${live.bytes_total?'':'unknown'}" style="margin-top:10px">
+          <i style="width:${pct}%"></i>
+        </div>
+        <div class="hist-meta" style="margin-top:6px">
+          <span>${esc(live.name||'')}</span>
+          <span>${pct.toFixed(0)}% · ${live.files_done||0}/${live.total_files||e.total} 个</span>
+        </div>` : ''}
+      ${e.message ? `<div class="hist-meta" style="margin-top:6px"><span>${esc(e.message)}</span></div>` : ''}
+      ${e.files && e.files.length ? `
+        <details style="margin-top:8px">
+          <summary style="font-size:11px">文件清单（${okFiles} 成功${badFiles?` / ${badFiles} 失败`:''}）</summary>
+          <div class="hist-files">${e.files.slice(0,200).map(f =>
+            `<div class="${f.ok?'f-ok':(f.skipped?'':'f-bad')}">${f.ok?'✓':(f.skipped?'–':'✗')} ${esc(f.name||f.url)}${f.ok&&f.size?` <span style="opacity:.6">${fmtSize(f.size)}</span>`:''}${f.error?` <span class="f-bad">${esc(f.error)}</span>`:''}</div>`
+          ).join('')}</div>
+        </details>` : ''}
+    </div>`;
+  }).join('');
+
+  // 绑定按钮
+  document.querySelectorAll('.btn-hist-cancel').forEach(b => b.onclick = async ev => {
+    ev.stopPropagation();
+    b.disabled = true; b.textContent = '取消中…';
+    try{
+      const r = await fetch(`/api/history/${b.dataset.id}/cancel`, {method:'POST'});
+      const d = await r.json();
+      if(d.error) throw new Error(d.error);
+      setTimeout(loadHistory, 600);
+    }catch(e){ b.textContent = '取消失败'; }
+  });
+  document.querySelectorAll('.btn-hist-open').forEach(b => b.onclick = async ev => {
+    ev.stopPropagation();
+    try{
+      const r = await fetch(`/api/history/${b.dataset.id}/open`, {method:'POST'});
+      const d = await r.json();
+      if(d.error) alert(d.error);
+    }catch(e){ alert('打开失败: ' + e.message); }
+  });
+  document.querySelectorAll('.btn-hist-del').forEach(b => b.onclick = async ev => {
+    ev.stopPropagation();
+    try{
+      await fetch(`/api/history/${b.dataset.id}`, {method:'DELETE'});
+      loadHistory();
+    }catch(e){}
+  });
+}
+
+function startHistPoll(){
+  clearInterval(state.histTimer);
+  state.histTimer = setInterval(() => {
+    // 只在历史页可见、或有任务在跑时刷新，避免无谓轮询
+    const onHist = !$('#view-history').classList.contains('hidden');
+    const anyRunning = state.history.some(e => e.running) || !!state.dlJob;
+    if(onHist || anyRunning) loadHistory();
+  }, 1500);
+}
+
+// ---------- 标签切换 ----------
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const view = tab.dataset.view;
+    $('#view-download').classList.toggle('hidden', view !== 'download');
+    $('#view-history').classList.toggle('hidden', view !== 'history');
+    $('#footbar').classList.toggle('hidden', view !== 'download' || !state.items.length);
+    if(view === 'history') loadHistory();
+  };
+});
+
 // ---------- 事件绑定 ----------
 $('#btn-crawl').onclick = crawl;
 $('#url').addEventListener('keydown', e => { if(e.key === 'Enter') crawl(); });
 $('#btn-download').onclick = download;
 $('#btn-cancel').onclick = async () => {
-  if(state.dlJob) await fetch(`/api/job/${state.dlJob}/cancel`, {method:'POST'});
+  if(!state.dlJob) return;
+  const btn = $('#btn-cancel');
+  btn.disabled = true;
+  btn.textContent = '取消中…';
+  try{
+    await fetch(`/api/job/${state.dlJob}/cancel`, {method:'POST'});
+    $('#dl-status').innerHTML = '<span style="color:var(--yellow)">正在取消…</span>';
+    // 立刻刷新一次，让用户尽快看到反馈
+    setTimeout(() => { const t = state.timer; }, 0);
+  }catch(e){
+    btn.disabled = false;
+    btn.textContent = '取消';
+  }
+};
+$('#btn-hist-refresh').onclick = loadHistory;
+$('#btn-hist-clear').onclick = async () => {
+  if(!confirm('清空下载历史记录？\n（已下载的文件不会被删除）')) return;
+  await fetch('/api/history', {method:'DELETE'});
+  loadHistory();
 };
 $('#btn-save-out').onclick = async () => {
   const dir = $('#out_dir').value.trim();
@@ -1060,7 +1578,8 @@ $('#btn-reset-out').onclick = async () => {
   try{ await postConfig({reset: true}); }
   catch(e){ $('#cfg-hint').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
 };
-$('#btn-all').onclick = () => { state.selected = new Set(visible().map(i=>i.id)); renderGrid(); updateFootbar(); };$('#btn-none').onclick = () => { state.selected.clear(); renderGrid(); updateFootbar(); };
+$('#btn-all').onclick = () => { state.selected = new Set(visible().map(i=>i.id)); renderGrid(); updateFootbar(); };
+$('#btn-none').onclick = () => { state.selected.clear(); renderGrid(); updateFootbar(); };
 $('#btn-best').onclick = () => {
   // 只选没有同名低清版本的主资源，并按类型排除分片
   state.selected = new Set(visible().filter(i => i.primary && i.type!=='segment').map(i=>i.id));
@@ -1070,6 +1589,8 @@ window.addEventListener('beforeunload', e => {
   if(state.dlJob){ e.preventDefault(); e.returnValue = ''; }
 });
 loadStatus();
+loadHistory();
+startHistPoll();
 </script>
 </body>
 </html>

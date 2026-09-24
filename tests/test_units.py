@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -772,6 +773,228 @@ class TestConfig(unittest.TestCase):
         value = cfg.get("download.out_dir")
         self.assertIsInstance(value, str)
         self.assertTrue(any("out_dir" in w for w in cfg.warnings) or value == "123")
+
+
+class TestCancelToken(unittest.TestCase):
+    """取消令牌：跨线程可见、幂等、可等待。"""
+
+    def test_initial_state(self):
+        from mediaharvest.control import CancelToken
+        t = CancelToken()
+        self.assertFalse(t.cancelled)
+        t.check()          # 未取消时不应抛异常
+
+    def test_cancel_is_idempotent(self):
+        from mediaharvest.control import CancelToken
+        t = CancelToken()
+        t.cancel("第一次")
+        t.cancel("第二次")          # 第二次不该覆盖原因
+        self.assertTrue(t.cancelled)
+        self.assertEqual(t.reason, "第一次")
+
+    def test_check_raises_after_cancel(self):
+        from mediaharvest.control import CancelToken, CancelledError
+        t = CancelToken()
+        t.cancel("测试")
+        with self.assertRaises(CancelledError):
+            t.check()
+
+    def test_visible_across_threads(self):
+        """取消信号从别的线程发出，下载线程也必须能看到 —— Web 界面就靠这个。"""
+        import threading
+        from mediaharvest.control import CancelToken
+        t = CancelToken()
+        threading.Thread(target=lambda: (time.sleep(0.1), t.cancel("跨线程"))).start()
+        self.assertTrue(t.wait(2.0), "另一线程发出的取消应能被感知")
+        self.assertTrue(t.cancelled)
+
+    def test_wait_times_out_when_not_cancelled(self):
+        from mediaharvest.control import CancelToken
+        t = CancelToken()
+        start = time.monotonic()
+        self.assertFalse(t.wait(0.15))
+        self.assertGreaterEqual(time.monotonic() - start, 0.1)
+
+    def test_reset(self):
+        from mediaharvest.control import CancelToken
+        t = CancelToken()
+        t.cancel("x")
+        t.reset()
+        self.assertFalse(t.cancelled)
+        self.assertEqual(t.reason, "")
+
+
+class TestProgress(unittest.TestCase):
+    """进度计算与节流上报。"""
+
+    def test_percentages(self):
+        from mediaharvest.control import Progress
+        p = Progress(total_files=4, files_done=1, bytes_done=50, bytes_total=100)
+        self.assertEqual(p.file_percent, 50.0)
+        # 整体 = (1 个已完成 + 当前 0.5) / 4
+        self.assertAlmostEqual(p.overall_percent, 37.5, places=1)
+
+    def test_unknown_size_returns_none(self):
+        from mediaharvest.control import Progress
+        p = Progress(total_files=2, bytes_total=0)
+        self.assertIsNone(p.file_percent)
+
+    def test_percent_is_capped(self):
+        from mediaharvest.control import Progress
+        p = Progress(total_files=1, files_done=1, bytes_done=200, bytes_total=100)
+        self.assertEqual(p.file_percent, 100.0)
+        self.assertLessEqual(p.overall_percent, 100.0)
+
+    def test_to_dict_is_json_serializable(self):
+        import json
+        from mediaharvest.control import Progress
+        d = Progress(total_files=2, files_done=1, name="a.jpg").to_dict()
+        json.dumps(d)          # 不抛异常即通过
+        self.assertIn("overall_percent", d)
+        self.assertIn("phase", d)
+
+    def test_reporter_throttles_but_flushes(self):
+        """节流不能丢掉最终状态 —— 否则进度条会停在中间。"""
+        from mediaharvest.control import ProgressReporter
+        got = []
+        rep = ProgressReporter(lambda p: got.append(p.bytes_done), interval=10.0)
+        rep.start_file(1, "x", 1000)
+        for _ in range(50):
+            rep.add_bytes(10)          # 快速连续更新，应被节流
+        rep.flush()
+        self.assertLess(len(got), 50, "应被节流")
+        self.assertEqual(got[-1], 500, "最后一次必须上报真实值")
+
+    def test_reporter_counts(self):
+        from mediaharvest.control import ProgressReporter
+        rep = ProgressReporter()
+        rep.state.total_files = 3
+        rep.finish_file(ok=True, size=100)
+        rep.finish_file(ok=False)
+        rep.finish_file(ok=False, skipped=True)
+        self.assertEqual(rep.state.ok, 1)
+        self.assertEqual(rep.state.failed, 1)
+        self.assertEqual(rep.state.skipped, 1)
+        self.assertEqual(rep.state.bytes_finished, 100)
+
+    def test_snapshot_is_copied(self):
+        """回调拿到的应是快照，后续变化不能影响它。"""
+        from mediaharvest.control import ProgressReporter
+        got = []
+        rep = ProgressReporter(lambda p: got.append(p), interval=0)
+        rep.start_file(1, "x", 100)
+        rep.add_bytes(50)
+        first = got[0]
+        rep.add_bytes(50)
+        self.assertEqual(first.bytes_done, 0, "首次上报时字节应为 0")
+        self.assertEqual(got[-1].bytes_done, 100)
+
+
+class TestSession(unittest.TestCase):
+    """时间戳会话目录与历史记录。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mh-sess-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_timestamp_name_format(self):
+        from mediaharvest.session import timestamp_name
+        name = timestamp_name("我的视频")
+        self.assertRegex(name, r"^\d{4}-\d{2}-\d{2}_\d{6}_我的视频$")
+
+    def test_timestamp_name_without_title(self):
+        from mediaharvest.session import timestamp_name
+        self.assertRegex(timestamp_name(""), r"^\d{4}-\d{2}-\d{2}_\d{6}$")
+
+    def test_dangerous_chars_are_cleaned(self):
+        """标题里的斜杠、冒号等不能破坏目录名。"""
+        from mediaharvest.session import timestamp_name
+        name = timestamp_name('a/b:c*d?e"f<g>h|i')
+        self.assertNotIn("/", name)
+        self.assertNotIn(":", name)
+        self.assertNotIn("*", name)
+        self.assertNotIn('"', name)
+
+    def test_session_dir_creates_and_stays_unique(self):
+        from mediaharvest.session import session_dir
+        a = session_dir(self.tmp, "同名", now=1700000000)
+        b = session_dir(self.tmp, "同名", now=1700000000)
+        self.assertTrue(os.path.isdir(a))
+        self.assertTrue(os.path.isdir(b))
+        self.assertNotEqual(a, b, "同一秒内重复创建也不能冲突")
+        self.assertTrue(os.path.basename(b).endswith("_2"))
+
+    def test_session_dir_is_absolute(self):
+        from mediaharvest.session import session_dir
+        d = session_dir(self.tmp, "x")
+        self.assertTrue(os.path.isabs(d))
+        self.assertTrue(d.startswith(os.path.abspath(self.tmp)))
+
+    def test_history_roundtrip(self):
+        from mediaharvest.session import HistoryEntry, HistoryStore
+        path = os.path.join(self.tmp, "h.json")
+        store = HistoryStore(path)
+        entry = HistoryEntry(id="e1", created=time.time(), title="测试",
+                             out_dir="/tmp/x", status="done", ok=2, total=3)
+        store.add(entry)
+        store.append_file("e1", {"name": "a.jpg", "ok": True, "size": 10})
+
+        again = HistoryStore(path)
+        got = again.get("e1")
+        self.assertIsNotNone(got)
+        self.assertEqual(got.title, "测试")
+        self.assertEqual(got.ok, 2)
+        self.assertEqual(len(got.files), 1)
+
+    def test_history_newest_first(self):
+        from mediaharvest.session import HistoryEntry, HistoryStore
+        store = HistoryStore(os.path.join(self.tmp, "h.json"))
+        for i in range(3):
+            store.add(HistoryEntry(id=f"e{i}", created=time.time(), title=f"t{i}"))
+        self.assertEqual([e.id for e in store.list()], ["e2", "e1", "e0"])
+
+    def test_history_update_and_remove(self):
+        from mediaharvest.session import HistoryEntry, HistoryStore
+        store = HistoryStore(os.path.join(self.tmp, "h.json"))
+        store.add(HistoryEntry(id="e1", created=time.time()))
+        store.update("e1", status="cancelled", message="已取消")
+        self.assertEqual(store.get("e1").status, "cancelled")
+        self.assertTrue(store.remove("e1"))
+        self.assertIsNone(store.get("e1"))
+
+    def test_stale_running_recovered_on_reload(self):
+        """重启后遗留的 running 必须被标为中断，否则永远显示「进行中」。"""
+        from mediaharvest.session import HistoryEntry, HistoryStore
+        path = os.path.join(self.tmp, "h.json")
+        store = HistoryStore(path)
+        store.add(HistoryEntry(id="e1", created=time.time(), status="running"))
+        reloaded = HistoryStore(path)
+        self.assertEqual(reloaded.get("e1").status, "error")
+        self.assertIn("中断", reloaded.get("e1").message)
+
+    def test_corrupt_history_file_is_survivable(self):
+        from mediaharvest.session import HistoryStore
+        path = os.path.join(self.tmp, "bad.json")
+        with open(path, "w") as fh:
+            fh.write("{ this is not json")
+        store = HistoryStore(path)          # 不应抛异常
+        self.assertEqual(store.list(), [])
+        # 对象仍可用，能正常写入新记录
+        from mediaharvest.session import HistoryEntry
+        store.add(HistoryEntry(id="x", created=time.time()))
+        self.assertEqual(len(store.list()), 1)
+
+    def test_duration_and_serialization(self):
+        from mediaharvest.session import HistoryEntry
+        e = HistoryEntry(id="e", created=100.0, finished=112.5, status="done")
+        self.assertAlmostEqual(e.duration, 12.5)
+        d = e.to_dict()
+        self.assertEqual(d["duration"], 12.5)
+        self.assertIn("created_text", d)
+        self.assertIn("dir_name", d)
+        self.assertFalse(d["running"])
 
 
 if __name__ == "__main__":

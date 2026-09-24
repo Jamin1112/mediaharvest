@@ -31,3 +31,4 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+.mediaharvest_history.json
