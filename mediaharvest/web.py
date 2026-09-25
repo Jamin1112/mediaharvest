@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 import sys
 import threading
@@ -31,7 +32,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = "mediaharvest"
 
-from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from flask import Flask, Response, jsonify, render_template_string, request, send_file, stream_with_context
 
 from . import ytdlp as ytdlp_mod
 from .browser import ensure_browser_path, playwright_available
@@ -635,6 +636,38 @@ def api_history_open(entry_id: str) -> Response:
     return jsonify({"ok": True, "path": entry.out_dir})
 
 
+@app.route("/api/history/<entry_id>/file/<int:file_index>")
+def api_history_file(entry_id: str, file_index: int) -> Response:
+    """预览历史记录里的本地媒体文件。
+
+    只允许访问该历史条目 out_dir 下、下载成功且仍存在的普通文件，避免把
+    任意本机路径暴露给浏览器。``conditional=True`` 让 Flask 自动处理
+    Range 请求，视频 / 音频可以边下边播和拖动进度。
+    """
+    entry = RUNNER.history.get(entry_id)
+    if not entry or not entry.out_dir:
+        return jsonify({"error": "记录不存在"}), 404
+    if file_index < 0 or file_index >= len(entry.files):
+        return jsonify({"error": "文件不存在"}), 404
+    info = entry.files[file_index] or {}
+    if not info.get("ok"):
+        return jsonify({"error": "文件未下载成功"}), 404
+
+    root = os.path.realpath(entry.out_dir)
+    path = os.path.realpath(info.get("path") or "")
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "文件不存在"}), 404
+    try:
+        common = os.path.commonpath([root, path])
+    except ValueError:
+        return jsonify({"error": "非法文件路径"}), 403
+    if common != root:
+        return jsonify({"error": "非法文件路径"}), 403
+
+    mimetype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return send_file(path, mimetype=mimetype, conditional=True)
+
+
 def _open_in_file_manager(path: str) -> None:
     """在系统文件管理器里打开目录（跨平台，失败不影响主流程）。"""
     import subprocess
@@ -712,23 +745,57 @@ def api_proxy() -> Response:
 
     referer = request.args.get("referer", "") or target
 
-    async def fetch() -> tuple:
-        from .fetcher import Fetcher
-
-        async with Fetcher(timeout=20.0, retries=1) as fetcher:
-            resp = await fetcher.get(target, referer=referer)
-            return resp.status_code, resp.headers.get("content-type", ""), resp.content
+    import httpx
 
     try:
-        status, ctype, body = asyncio.run_coroutine_threadsafe(
-            fetch(), RUNNER._loop
-        ).result(timeout=30)
+        from .fetcher import DEFAULT_UA
+
+        req_headers = {
+            "User-Agent": DEFAULT_UA,
+            "Referer": referer,
+            "Accept": request.headers.get("Accept", "*/*"),
+        }
+        if request.headers.get("Range"):
+            req_headers["Range"] = request.headers["Range"]
+
+        client = httpx.Client(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+            max_redirects=10,
+        )
+        req = client.build_request("GET", target, headers=req_headers)
+        upstream = client.send(req, stream=True)
     except Exception as exc:
         return jsonify({"error": f"拉取失败: {exc}"}), 502
 
-    if status >= 400:
+    if upstream.status_code >= 400:
+        status = upstream.status_code
+        upstream.close()
+        client.close()
         return jsonify({"error": f"远端返回 {status}"}), 502
-    return Response(body, mimetype=ctype or "application/octet-stream")
+
+    headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() in {"content-length", "content-range", "accept-ranges"}
+    }
+    ctype = upstream.headers.get("content-type", "") or "application/octet-stream"
+
+    def generate() -> Any:
+        try:
+            for chunk in upstream.iter_raw(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+            client.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=upstream.status_code,
+        mimetype=ctype,
+        headers=headers,
+        direct_passthrough=True,
+    )
 
 
 def _version() -> str:
@@ -1100,14 +1167,16 @@ details[open]>summary::before{transform:rotate(90deg)}
 .tag.audio{background:rgba(180,83,9,.72)}
 .tag.image{background:rgba(29,78,216,.72)}
 .tag.segment,.tag.other{background:rgba(51,65,85,.72)}
-.tile .ext{position:absolute;bottom:8px;right:8px;z-index:2;width:26px;height:26px;
+.tile .ext,.tile .prev{position:absolute;bottom:8px;z-index:2;width:26px;height:26px;padding:0;
   display:grid;place-items:center;border-radius:8px;color:#fff;text-decoration:none;
   background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.18);
   backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
   opacity:0;transform:translateY(4px);transition:.2s var(--ease)}
-.tile:hover .ext{opacity:1;transform:translateY(0)}
-.tile .ext:hover{background:rgba(0,0,0,.75)}
-.tile .ext svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2.1;
+.tile .ext{right:8px}
+.tile .prev{left:8px}
+.tile:hover .ext,.tile:hover .prev{opacity:1;transform:translateY(0)}
+.tile .ext:hover,.tile .prev:hover{background:rgba(0,0,0,.75)}
+.tile .ext svg,.tile .prev svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2.1;
   stroke-linecap:round;stroke-linejoin:round}
 
 /* 骨架屏 / 空状态 */
@@ -1192,6 +1261,9 @@ details[open]>summary::before{transform:rotate(90deg)}
 .hist-files .f-ok{color:var(--ok)}
 .hist-files .f-bad{color:var(--bad)}
 .btn-mini{padding:4px 10px;font-size:11px;border-radius:8px}
+.hist-preview{margin-left:8px;color:var(--brand);text-decoration:none;cursor:pointer;
+  border:0;background:transparent;padding:0;font:inherit}
+.hist-preview:hover{text-decoration:underline}
 
 /* ---------- 底部浮动坞 ---------- */
 .footbar{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:35;
@@ -1222,6 +1294,32 @@ details[open]>summary::before{transform:rotate(90deg)}
 .toast.bad .ti{background:var(--bad-soft);color:var(--bad)}
 .toast.warn .ti{background:var(--warn-soft);color:var(--warn)}
 .toast .tm{flex:1;min-width:0;word-break:break-word;line-height:1.5}
+
+/* ---------- 媒体预览 ---------- */
+.preview{position:fixed;inset:0;z-index:70;display:grid;place-items:center;
+  padding:14px;background:rgba(0,0,0,.72);backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px)}
+.preview-box{width:min(1500px,calc(100vw - 28px));height:min(920px,calc(100vh - 28px));
+  display:flex;flex-direction:column;border:1px solid var(--stroke-2);
+  border-radius:var(--r-lg);background:var(--surface);box-shadow:var(--shadow-lg);
+  overflow:hidden}
+.preview[data-kind="audio"] .preview-box{height:auto;min-height:260px}
+.preview-head{display:flex;align-items:center;gap:12px;justify-content:space-between;
+  padding:12px 14px;border-bottom:1px solid var(--stroke);background:var(--surface-2)}
+.preview-title{font-size:13px;font-weight:600;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.preview-actions{display:flex;gap:8px;align-items:center;flex-shrink:0}
+.preview-actions a{display:inline-flex;align-items:center;justify-content:center;color:var(--fg);
+  text-decoration:none;border:1px solid var(--stroke);background:var(--surface-2)}
+.preview-actions a:hover{border-color:var(--stroke-2);background:var(--surface-3)}
+.preview-body{padding:14px;display:grid;place-items:center;min-height:0;flex:1;overflow:auto;
+  background:rgba(0,0,0,.18)}
+.preview-body img{max-width:100%;max-height:100%;object-fit:contain;
+  border-radius:var(--r-sm)}
+.preview-body video{width:100%;height:100%;object-fit:contain;border-radius:var(--r-sm);
+  background:#000}
+.preview-body audio{width:min(720px,100%)}
+.preview-empty{color:var(--fg-3);font-size:13px;text-align:center;padding:40px 20px}
 
 .hidden{display:none!important}
 @media(max-width:720px){
@@ -1475,6 +1573,19 @@ details[open]>summary::before{transform:rotate(90deg)}
   </div>
 </div>
 
+<div class="preview hidden" id="preview-modal" role="dialog" aria-modal="true" aria-label="媒体预览">
+  <div class="preview-box">
+    <div class="preview-head">
+      <div class="preview-title" id="preview-title"></div>
+      <div class="preview-actions">
+        <a class="btn-mini" id="preview-open" href="#" target="_blank" rel="noreferrer">新标签打开</a>
+        <button class="sm" id="preview-close" type="button">关闭</button>
+      </div>
+    </div>
+    <div class="preview-body" id="preview-body"></div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script>
@@ -1691,6 +1802,48 @@ function visible(){
 }
 
 const EXT_ICON = '<svg viewBox="0 0 24 24"><path d="M14 5h5v5"/><path d="M19 5 11 13"/><path d="M18 14.5V18a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3.5"/></svg>';
+const PREVIEW_ICON = '<svg viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+function canPreviewType(type){
+  return ['image','video','audio','hls','dash'].includes(type);
+}
+
+function remotePreviewUrl(item){
+  return `/api/proxy?url=${encodeURIComponent(item.url)}&referer=${encodeURIComponent(item.referer||item.page_url||'')}`;
+}
+
+function openPreview(kind, src, title, openUrl){
+  const modal = $('#preview-modal');
+  const body = $('#preview-body');
+  $('#preview-title').textContent = title || '媒体预览';
+  $('#preview-open').href = openUrl || src;
+  modal.dataset.kind = kind || '';
+  let html = '';
+  if(kind === 'image'){
+    html = `<img src="${esc(src)}" alt="${esc(title||'媒体预览')}">`;
+  }else if(kind === 'audio'){
+    html = `<audio src="${esc(src)}" controls autoplay data-preview-player></audio>`;
+  }else if(kind === 'video' || kind === 'hls' || kind === 'dash'){
+    html = `<video src="${esc(src)}" controls autoplay playsinline data-preview-player></video>`;
+  }else{
+    html = '<div class="preview-empty">这种文件暂不支持内嵌预览，可以在新标签页打开。</div>';
+  }
+  body.innerHTML = html;
+  const player = body.querySelector('[data-preview-player]');
+  if(player){
+    player.onerror = () => {
+      body.innerHTML = '<div class="preview-empty">浏览器无法直接播放这个媒体格式。可以点右上角“新标签打开”，或先下载后从历史记录预览本地文件。</div>';
+    };
+  }
+  modal.classList.remove('hidden');
+}
+
+function closePreview(){
+  const modal = $('#preview-modal');
+  $('#preview-body').innerHTML = '';
+  modal.dataset.kind = '';
+  modal.classList.add('hidden');
+}
 
 function fmtDur(s){
   if(!s && s !== 0) return '';
@@ -1724,7 +1877,10 @@ function renderGrid(){
     return `<div class="tile ${sel?'sel':''}" data-id="${i.id}" title="${esc(name)}">
       <div class="tick">${sel?'✓':''}</div>
       <div class="tag ${i.type}">${TYPE_LABEL[i.type]||i.type}</div>
-      <div class="thumbwrap">${thumb}<a class="ext" href="${esc(i.url)}" target="_blank" rel="noreferrer" title="在新标签页打开原始地址">${EXT_ICON}</a></div>
+      <div class="thumbwrap">${thumb}
+        ${canPreviewType(i.type) ? `<button class="prev" type="button" title="在线预览">${PREVIEW_ICON}</button>` : ''}
+        <a class="ext" href="${esc(i.url)}" target="_blank" rel="noreferrer" title="在新标签页打开原始地址">${EXT_ICON}</a>
+      </div>
       <div class="meta">
         <div class="nm" title="${esc(i.url)}">${esc(name)}</div>
         <div class="sub"><span>${esc(i.source_label||'')}</span><span>${esc(bits.join(' · '))}</span></div>
@@ -1741,6 +1897,13 @@ function renderGrid(){
     // 「打开原地址」不应连带切换选中状态
     const ext = t.querySelector('.ext');
     if(ext) ext.onclick = ev => ev.stopPropagation();
+    const prev = t.querySelector('.prev');
+    if(prev) prev.onclick = ev => {
+      ev.stopPropagation();
+      const item = state.items.find(x => x.id === t.dataset.id);
+      if(!item) return;
+      openPreview(item.type, remotePreviewUrl(item), item.display_name || item.url, item.url);
+    };
   });
   updateStats();
 }
@@ -2015,8 +2178,8 @@ function renderHistory(){
       ${e.files && e.files.length ? `
         <details class="adv" style="margin-top:10px;border-top:0;padding-top:0">
           <summary>文件清单（${okFiles} 成功${badFiles?` / ${badFiles} 失败`:''}）</summary>
-          <div class="hist-files">${e.files.slice(0,200).map(f =>
-            `<div class="${f.ok?'f-ok':(f.skipped?'':'f-bad')}">${f.ok?'✓':(f.skipped?'–':'✗')} ${esc(f.name||f.url)}${f.ok&&f.size?` <span style="opacity:.6">${fmtSize(f.size)}</span>`:''}${f.error?` <span class="f-bad">${esc(f.error)}</span>`:''}</div>`
+          <div class="hist-files">${e.files.slice(0,200).map((f,idx) =>
+            `<div class="${f.ok?'f-ok':(f.skipped?'':'f-bad')}">${f.ok?'✓':(f.skipped?'–':'✗')} ${esc(f.name||f.url)}${f.ok&&f.size?` <span style="opacity:.6">${fmtSize(f.size)}</span>`:''}${f.ok&&canPreviewType(f.type)?` <button class="hist-preview" data-entry="${e.id}" data-index="${idx}" data-type="${esc(f.type)}" data-title="${esc(f.name||f.url)}" type="button">预览</button>`:''}${f.error?` <span class="f-bad">${esc(f.error)}</span>`:''}</div>`
           ).join('')}</div>
         </details>` : ''}
     </div>`;
@@ -2049,6 +2212,11 @@ function renderHistory(){
       toast('已删除该条记录', 'ok', 2400);
       loadHistory();
     }catch(e){}
+  });
+  document.querySelectorAll('.hist-preview').forEach(b => b.onclick = ev => {
+    ev.stopPropagation();
+    const src = `/api/history/${b.dataset.entry}/file/${b.dataset.index}`;
+    openPreview(b.dataset.type, src, b.dataset.title || '媒体预览', src);
   });
 }
 
@@ -2118,6 +2286,10 @@ $('#btn-reset-out').onclick = async () => {
   try{ await postConfig({reset: true}); }
   catch(e){ $('#cfg-hint').innerHTML = `<span class="err">${esc(e.message)}</span>`; toast(e.message, 'bad'); }
 };
+$('#preview-close').onclick = closePreview;
+$('#preview-modal').onclick = e => {
+  if(e.target === $('#preview-modal')) closePreview();
+};
 $('#btn-all').onclick = () => { state.selected = new Set(visible().map(i=>i.id)); renderGrid(); updateFootbar(); };
 $('#btn-none').onclick = () => { state.selected.clear(); renderGrid(); updateFootbar(); };
 $('#btn-best').onclick = () => {
@@ -2130,6 +2302,10 @@ $('#btn-best').onclick = () => {
 document.addEventListener('keydown', e => {
   const tag = (e.target.tagName || '').toLowerCase();
   const typing = tag === 'input' || tag === 'select' || tag === 'textarea';
+  if(e.key === 'Escape' && !$('#preview-modal').classList.contains('hidden')){
+    closePreview();
+    return;
+  }
   if(e.key === '/' && !typing){ e.preventDefault(); $('#url').focus(); $('#url').select(); return; }
   if(e.key === 'Escape'){
     if(document.activeElement && typing){ document.activeElement.blur(); return; }
