@@ -1771,8 +1771,8 @@ function renderResult(j){
     toast('未发现可下载的媒体资源', 'warn');
     return;
   }
-  // 默认选中所有主资源
-  state.selected = new Set(state.items.filter(i => i.primary).map(i => i.id));
+  // 分析完成后只展示资源，不自动勾选，避免误下大批文件。
+  state.selected = new Set();
   renderChips(j.counts || {});
   renderGrid();
   const warn = (j.warnings || []).slice(0,3);
