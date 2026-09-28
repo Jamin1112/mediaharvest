@@ -49,6 +49,24 @@
 「保存目录」右侧的 **存为默认** 会把当前目录写进配置文件，下次打开就是它。
 高级选项里有**音质**、**专辑/歌单是否整张抓**、**是否写音乐标签**三个开关。
 
+### macOS 桌面版
+
+不想每次敲命令，可以生成一个本地桌面 App：
+
+```bash
+./setup.sh
+./scripts/make_macos_app.sh
+open dist/MediaHarvest.app
+```
+
+之后直接双击 `dist/MediaHarvest.app` 即可。这个 App 会复用项目里的 `.venv`，
+启动本地 `mh-web` 服务并打开浏览器；如果服务已经在运行，则直接打开界面。
+运行日志写在 `logs/mediaharvest-desktop.log`，方便排查启动问题。
+
+注意：当前桌面版是轻量 App 壳，不是完全独立安装包。分享给别人时，建议先分享
+项目压缩包或 GitHub 仓库，让对方运行 `./setup.sh` 和 `./scripts/make_macos_app.sh`。
+后续如果要面向普通用户分发，可以再升级成 PyInstaller 或 Tauri 的独立安装包。
+
 界面默认深色主题，右上角按钮可切换浅色（选择会记在浏览器里）。几个顺手的细节：
 
 - `/` 聚焦地址栏，`Esc` 清空当前勾选，`⌘/Ctrl + Enter` 直接分析或下载。

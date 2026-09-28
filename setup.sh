@@ -64,6 +64,10 @@ cat <<EOF
   Web 界面:
     ./mh-web                                  # 自动打开 http://127.0.0.1:8848
 
+  macOS 桌面版:
+    ./scripts/make_macos_app.sh               # 生成 dist/MediaHarvest.app
+    open dist/MediaHarvest.app                # 双击也可以
+
   环境自检:
     ./mh --selfcheck
 
