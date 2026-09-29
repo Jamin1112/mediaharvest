@@ -18,6 +18,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import signal
 import sys
 import threading
 import time
@@ -497,6 +498,21 @@ def api_status() -> Response:
     })
 
 
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown() -> Response:
+    """退出本地 Web 服务。
+
+    桌面版用浏览器承载本地服务，用户需要一个比 ``pkill`` 更顺手的退出入口。
+    延迟退出是为了先把 JSON 响应发回前端，让页面能显示提示。
+    """
+    def stop() -> None:
+        time.sleep(0.35)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop, daemon=True).start()
+    return jsonify({"ok": True, "message": "MediaHarvest 正在退出"})
+
+
 @app.route("/api/config", methods=["GET"])
 def api_config_get() -> Response:
     """查看当前配置（含候选路径与优先级说明）。"""
@@ -972,8 +988,9 @@ body{
   border:1px solid var(--stroke);background:var(--surface-2);color:var(--fg-2);
   cursor:pointer;transition:.2s var(--ease)
 }
-.icon-btn:hover{color:var(--fg);border-color:var(--stroke-2);background:var(--surface-3)}
-.icon-btn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.9;
+  .icon-btn:hover{color:var(--fg);border-color:var(--stroke-2);background:var(--surface-3)}
+  .icon-btn.danger:hover{color:var(--bad);border-color:var(--bad);background:var(--bad-soft)}
+  .icon-btn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.9;
   stroke-linecap:round;stroke-linejoin:round}
 
 /* ---------- 布局 ---------- */
@@ -1358,6 +1375,9 @@ details[open]>summary::before{transform:rotate(90deg)}
   <div class="top-actions">
     <span class="version">v{{ version }}</span>
     <button class="icon-btn" id="btn-theme" type="button" title="切换深色 / 浅色" aria-label="切换主题"></button>
+    <button class="icon-btn danger" id="btn-shutdown" type="button" title="退出 MediaHarvest" aria-label="退出 MediaHarvest">
+      <svg viewBox="0 0 24 24"><path d="M12 2v10"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>
+    </button>
   </div>
 </header>
 
@@ -1614,6 +1634,22 @@ function setTheme(t){
   setTheme(t || 'dark');  // 默认深色，只有用户手动切过才跟随保存值
 })();
 $('#btn-theme').onclick = () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+$('#btn-shutdown').onclick = async () => {
+  const running = state.dlJob ? '\n当前有下载任务正在运行，退出会中断任务。' : '';
+  if(!confirm('退出 MediaHarvest 本地服务？' + running)) return;
+  const btn = $('#btn-shutdown');
+  btn.disabled = true;
+  try{
+    await fetch('/api/shutdown', {method:'POST'});
+    toast('MediaHarvest 正在退出，可以关闭这个页面了', 'ok', 7000);
+    setTimeout(() => {
+      document.body.innerHTML = '<div style="min-height:100vh;display:grid;place-items:center;background:#070a12;color:#e9eef8;font:15px -apple-system,BlinkMacSystemFont,sans-serif;text-align:center"><div><h1 style="font-size:20px;margin:0 0 10px">MediaHarvest 已退出</h1><p style="color:#a7b3c9;margin:0">现在可以关闭这个浏览器标签页。</p></div></div>';
+    }, 500);
+  }catch(e){
+    btn.disabled = false;
+    toast('退出失败，请在终端运行 pkill -f MediaHarvest', 'bad');
+  }
+};
 
 /* ---------- 轻提示 ---------- */
 function toast(msg, kind, ms){

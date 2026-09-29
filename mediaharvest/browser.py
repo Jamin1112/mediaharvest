@@ -15,16 +15,23 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from .models import MediaItem, MediaType, Source
 from .utils import classify, ext_from_content_type, resolve_url, strip_tracking, url_ext
 
-#: 项目内浏览器目录，保证沙箱环境下也能安装
-_DEFAULT_BROWSERS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".playwright-browsers"
-)
+def _resource_root() -> str:
+    """项目/打包资源根目录。"""
+    frozen_root = getattr(sys, "_MEIPASS", "")
+    if frozen_root:
+        return frozen_root
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+#: 项目内或 App 包内浏览器目录，保证沙箱/打包环境下也能安装和查找。
+_DEFAULT_BROWSERS_DIR = os.path.join(_resource_root(), ".playwright-browsers")
 
 
 def ensure_browser_path() -> str:

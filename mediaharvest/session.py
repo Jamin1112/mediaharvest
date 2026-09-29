@@ -145,7 +145,9 @@ class HistoryStore:
 
     def __init__(self, path: str = "") -> None:
         if not path:
-            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            root = os.environ.get("MEDIAHARVEST_STATE_DIR") or os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
             path = os.path.join(root, ".mediaharvest_history.json")
         self.path = path
         self._lock = threading.RLock()

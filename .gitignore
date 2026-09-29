@@ -10,6 +10,7 @@ dist/
 
 # 项目内虚拟环境与浏览器（体积大，不入库）
 .venv/
+.venv-build/
 .playwright-browsers/
 
 # 下载产物

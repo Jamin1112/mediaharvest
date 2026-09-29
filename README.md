@@ -67,6 +67,80 @@ open dist/MediaHarvest.app
 项目压缩包或 GitHub 仓库，让对方运行 `./setup.sh` 和 `./scripts/make_macos_app.sh`。
 后续如果要面向普通用户分发，可以再升级成 PyInstaller 或 Tauri 的独立安装包。
 
+### macOS 独立安装包
+
+如果要分享给别人一个「下载后直接打开」的版本，用 PyInstaller 打独立 App：
+
+```bash
+./scripts/build_macos_dist.sh
+./scripts/make_dmg.sh
+```
+
+这两个命令的分工：
+
+- `./scripts/build_macos_dist.sh`：把当前代码打包成 `dist/MediaHarvest.app`。它会创建或复用
+  `.venv-build`，安装 PyInstaller 和项目依赖，把 Python 运行环境、项目代码、依赖以及
+  Playwright Chromium 浏览器一起放进 App。
+- `./scripts/make_dmg.sh`：把 `dist/MediaHarvest.app` 包成
+  `dist/MediaHarvest-macOS.dmg`。这个 DMG 就是发给别人下载的安装包，用户打开后可以把
+  `MediaHarvest.app` 拖到 Applications 里。
+
+流程可以理解成：
+
+```text
+你的代码
+  ↓ ./scripts/build_macos_dist.sh
+dist/MediaHarvest.app
+  ↓ ./scripts/make_dmg.sh
+dist/MediaHarvest-macOS.dmg
+```
+
+生成物：
+
+```text
+dist/MediaHarvest.app
+dist/MediaHarvest-macOS.dmg
+```
+
+这个版本会把 Python 运行环境、项目代码、依赖和 Playwright Chromium 浏览器一起打进
+App。用户不需要安装 Python，也不需要运行 `setup.sh`。首次打开后，配置、历史和日志会写到：
+
+```text
+~/Library/Application Support/MediaHarvest/
+```
+
+默认下载目录是：
+
+```text
+~/Downloads/MediaHarvest/
+```
+
+独立包体积会比较大，主要是 Chromium 浏览器资源。公开分发时还需要进一步做 Apple
+Developer 签名与 notarization，否则 macOS 可能提示「无法验证开发者」。
+
+如果后续加了新功能，需要重新生成安装包。建议流程：
+
+```bash
+# 1. 先本地测试功能
+./mh-web
+
+# 2. 确认没问题后重新生成 App
+./scripts/build_macos_dist.sh
+
+# 3. 重新生成 DMG 安装包
+./scripts/make_dmg.sh
+```
+
+新的安装包会覆盖生成到：
+
+```text
+dist/MediaHarvest-macOS.dmg
+```
+
+如果要区分版本，先改 `mediaharvest/__init__.py` 里的 `__version__`，并同步更新
+`packaging/MediaHarvest.spec` 里的 `CFBundleShortVersionString` 和 `CFBundleVersion`，
+再重新运行上面的两个打包命令。
+
 界面默认深色主题，右上角按钮可切换浅色（选择会记在浏览器里）。几个顺手的细节：
 
 - `/` 聚焦地址栏，`Esc` 清空当前勾选，`⌘/Ctrl + Enter` 直接分析或下载。
