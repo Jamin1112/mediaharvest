@@ -34,7 +34,7 @@ dependencies = [
 # 音乐标签写入（ID3/MP4/FLAC/Vorbis）。缺失时自动回退到内置纯 Python 实现，
 # 因此是可选的增强项，而不是硬依赖。
 music = ["mutagen>=1.45"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "debugpy>=1.8"]
 
 [project.scripts]
 mh = "mediaharvest.cli:main"

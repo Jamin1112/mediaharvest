@@ -75,10 +75,17 @@ def prepare_environment() -> Path:
     os.environ.setdefault("MEDIAHARVEST_DESKTOP_LOG_DIR", str(logs))
 
     if getattr(sys, "frozen", False):
-        resources = Path(sys.executable).resolve().parents[1] / "Resources"
-        bundled_browsers = resources / ".playwright-browsers"
-        if bundled_browsers.exists():
-            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundled_browsers))
+        exe_dir = Path(sys.executable).resolve().parent
+        browser_candidates = [
+            exe_dir / ".playwright-browsers",
+            exe_dir / "_internal" / ".playwright-browsers",
+        ]
+        if sys.platform == "darwin":
+            browser_candidates.append(exe_dir.parent / "Resources" / ".playwright-browsers")
+        for bundled_browsers in browser_candidates:
+            if bundled_browsers.exists():
+                os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundled_browsers))
+                break
 
     return logs
 

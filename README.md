@@ -141,6 +141,43 @@ dist/MediaHarvest-macOS.dmg
 `packaging/MediaHarvest.spec` 里的 `CFBundleShortVersionString` 和 `CFBundleVersion`，
 再重新运行上面的两个打包命令。
 
+### Windows 独立安装包
+
+Windows 版本也用 PyInstaller 打包，需要在 Windows 机器上构建：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_dist.ps1
+```
+
+生成物：
+
+```text
+dist\MediaHarvest\MediaHarvest.exe
+dist\MediaHarvest-Windows-Setup.exe   # 安装了 Inno Setup 6 时自动生成
+```
+
+这个脚本会创建或复用 `.venv-build-win`，安装 PyInstaller 和项目依赖，把 Python
+运行环境、项目代码、依赖以及 Playwright Chromium 浏览器一起放进
+`dist\MediaHarvest`。用户运行 `MediaHarvest.exe` 后，会启动本地 Web 界面并自动打开浏览器。
+
+如果只想生成绿色版目录，不生成安装器：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_dist.ps1 -NoInstaller
+```
+
+如果不想把 Chromium 打进包里（动态页面抓取功能会不可用）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_dist.ps1 -NoBrowser
+```
+
+安装器依赖 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。没安装时脚本会跳过安装器，
+但仍会生成可直接运行的 `dist\MediaHarvest\MediaHarvest.exe`。
+
+Windows 打包不能在 macOS 上可靠交叉编译；请在 Windows x64 环境、Windows 虚拟机或
+Windows CI runner 上运行上面的脚本。
+
 界面默认深色主题，右上角按钮可切换浅色（选择会记在浏览器里）。几个顺手的细节：
 
 - `/` 聚焦地址栏，`Esc` 清空当前勾选，`⌘/Ctrl + Enter` 直接分析或下载。
