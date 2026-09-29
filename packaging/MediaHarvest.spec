@@ -56,6 +56,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon=str(PROJECT_ROOT / "packaging" / "assets" / "app-icon.icns"),
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -76,9 +77,11 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="MediaHarvest.app",
+    icon=str(PROJECT_ROOT / "packaging" / "assets" / "app-icon.icns"),
     bundle_identifier="local.mediaharvest.desktop",
     info_plist={
         "CFBundleDisplayName": "MediaHarvest",
+        "CFBundleIconFile": "app-icon.icns",
         "CFBundleShortVersionString": "1.1.0",
         "CFBundleVersion": "1.1.0",
         "NSHighResolutionCapable": True,

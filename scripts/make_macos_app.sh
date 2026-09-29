@@ -14,6 +14,8 @@ CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 ICONSET="$RESOURCES/AppIcon.iconset"
+APP_ICON_PNG="$ROOT/packaging/assets/app-icon.png"
+APP_ICON_ICNS="$ROOT/packaging/assets/app-icon.icns"
 LOG_DIR="$ROOT/logs"
 
 echo "==> Building $APP_NAME.app"
@@ -102,8 +104,11 @@ exec "\$VENV_PY" -m mediaharvest.web >> "\$LOG_FILE" 2>&1
 LAUNCHER
 chmod +x "$MACOS/$APP_NAME"
 
-if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
-  SRC_ICON="$ROOT/mediaharvest/static/logo.png"
+if [ -f "$APP_ICON_ICNS" ]; then
+  cp "$APP_ICON_ICNS" "$RESOURCES/AppIcon.icns"
+  cp "$APP_ICON_PNG" "$RESOURCES/AppIcon.png"
+elif command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+  SRC_ICON="$APP_ICON_PNG"
   cp "$SRC_ICON" "$RESOURCES/AppIcon.png"
   for size in 16 32 128 256 512; do
     sips -z "$size" "$size" "$SRC_ICON" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
@@ -119,7 +124,7 @@ if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
     rm -rf "$ICONSET"
   fi
 else
-  cp "$ROOT/mediaharvest/static/logo.png" "$RESOURCES/AppIcon.png"
+  cp "$APP_ICON_PNG" "$RESOURCES/AppIcon.png"
 fi
 
 echo
