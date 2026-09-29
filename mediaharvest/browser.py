@@ -261,7 +261,15 @@ class BrowserRenderer:
 
                 # 反自动化检测（尽量温和，不破坏正常站点）
                 await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    """
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.open = () => null;
+                    document.addEventListener('click', event => {
+                        const link = event.target && event.target.closest
+                            ? event.target.closest('a[target="_blank"]') : null;
+                        if (link && !event.isTrusted) event.preventDefault();
+                    }, true);
+                    """
                 )
 
                 if self.cookies:
@@ -273,6 +281,7 @@ class BrowserRenderer:
                         result.errors.append(f"注入 Cookie 失败: {exc}")
 
                 page = await context.new_page()
+                context.on("page", lambda p: asyncio.create_task(_close_popup(p, result)))
                 sniffer = Sniffer(url, include_segments=self.include_segments)
 
                 if self.block_media:
@@ -407,6 +416,15 @@ async def _safe(coro: Any) -> None:
     """吞掉回调里的异常，避免影响主流程。"""
     try:
         await coro
+    except Exception:
+        pass
+
+
+async def _close_popup(page: Any, result: "RenderResult") -> None:
+    """关闭被目标站点脚本打开的新页面，避免分析时弹出额外窗口。"""
+    try:
+        await page.close()
+        result.errors.append("已拦截目标页面自动打开的新窗口")
     except Exception:
         pass
 

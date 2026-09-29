@@ -18,6 +18,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mediaharvest import config
+from mediaharvest.web import build_options
 from mediaharvest.extractor import Extractor, extract_from_html
 from mediaharvest.hls import (
     is_master_playlist,
@@ -480,6 +481,34 @@ class TestMediaItem(unittest.TestCase):
     def test_labels(self):
         self.assertEqual(MediaType.HLS.label, "HLS 流")
         self.assertEqual(Source.NETWORK.label, "网络嗅探")
+
+
+class TestWebOptions(unittest.TestCase):
+    """Web API 参数解析。"""
+
+    def test_build_options_parses_string_booleans(self):
+        options = build_options({
+            "headless": "false",
+            "scroll": "0",
+            "same_host": "true",
+            "segments": "yes",
+            "music": "off",
+            "expand_playlists": "no",
+            "music_tags": "false",
+        })
+        self.assertFalse(options.headless)
+        self.assertFalse(options.scroll)
+        self.assertTrue(options.same_host_only)
+        self.assertTrue(options.include_segments)
+        self.assertFalse(options.music)
+        self.assertFalse(options.expand_playlists)
+        self.assertFalse(options.music_tags)
+
+    def test_build_options_defaults_to_headless(self):
+        options = build_options({})
+        self.assertTrue(options.headless)
+        self.assertTrue(options.scroll)
+        self.assertTrue(options.music)
 
 
 class TestConfig(unittest.TestCase):

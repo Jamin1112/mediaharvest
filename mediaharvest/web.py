@@ -242,6 +242,23 @@ def config_dir() -> str:
     return _CONFIG_PATH
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """解析来自 JSON/表单/配置的布尔值。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
 def build_options(data: Dict[str, Any]) -> CrawlOptions:
     """把前端传来的参数转成 CrawlOptions。"""
     types = data.get("types") or ["image", "video"]
@@ -250,13 +267,13 @@ def build_options(data: Dict[str, Any]) -> CrawlOptions:
     return CrawlOptions(
         render=data.get("render", "auto"),
         use_ytdlp=data.get("ytdlp", "auto"),
-        same_host_only=bool(data.get("same_host")),
+        same_host_only=_as_bool(data.get("same_host"), False),
         max_depth=int(data.get("depth") or 0),
         max_pages=max(1, int(data.get("max_pages") or 1)),
         link_pattern=data.get("link_pattern", "") or "",
-        include_segments=bool(data.get("segments")),
-        headless=data.get("headless", True),
-        scroll=data.get("scroll", True),
+        include_segments=_as_bool(data.get("segments"), False),
+        headless=_as_bool(data.get("headless"), True),
+        scroll=_as_bool(data.get("scroll"), True),
         wait_after_load=float(data.get("wait") or 1.5),
         browser_timeout=float(data.get("browser_timeout") or 30.0),
         timeout=float(data.get("timeout") or 20.0),
@@ -268,13 +285,13 @@ def build_options(data: Dict[str, Any]) -> CrawlOptions:
         cookie_file=data.get("cookie_file", "") or "",
         types=tuple(types),
         # 音乐：前端未提供时沿用配置默认值（enabled/lyrics/cover 默认开）
-        music=bool(data.get("music", True)),
+        music=_as_bool(data.get("music"), True),
         quality=data.get("quality") or "best",
-        expand_playlists=bool(data.get("expand_playlists", True)),
+        expand_playlists=_as_bool(data.get("expand_playlists"), True),
         playlist_limit=max(1, int(data.get("playlist_limit") or 200)),
-        music_lyrics=bool(data.get("music_lyrics", True)),
-        music_cover=bool(data.get("music_cover", True)),
-        music_tags=bool(data.get("music_tags", True)),
+        music_lyrics=_as_bool(data.get("music_lyrics"), True),
+        music_cover=_as_bool(data.get("music_cover"), True),
+        music_tags=_as_bool(data.get("music_tags"), True),
     )
 
 
