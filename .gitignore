@@ -30,6 +30,8 @@ htmlcov/
 
 # 编辑器 / 系统
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
 .DS_Store
 .mediaharvest_history.json

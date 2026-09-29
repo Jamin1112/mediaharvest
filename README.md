@@ -184,6 +184,31 @@ Windows CI runner 上运行上面的脚本。
 - 每个资源卡片右下角的按钮可在新标签页打开原始地址，不改变勾选状态。
 - 分析过程中的进度、下载的实时速度与文件数都在页面上，完成后右下角有轻提示。
 
+### 调试启动
+
+如果 IDE 直接点 Debug 报 `Failed to launch Python DAP debug adapter`，可以改用 attach
+方式调试。先在终端启动调试服务：
+
+```bash
+.venv/bin/python debug_web.py
+```
+
+看到下面这行后，程序会等待 IDE 连接：
+
+```text
+debugpy is listening on 127.0.0.1:5678
+```
+
+然后在 VS Code / Cursor 里选择 `Attach MediaHarvest Web` 启动调试；在 PyCharm /
+JetBrains IDE 里新建 `Attach to DAP` 配置，Host 填 `127.0.0.1`，Port 填 `5678`。
+连接成功后 Web 界面会继续启动。
+
+如果只是想普通运行，不需要断点调试：
+
+```bash
+./mh-web
+```
+
 ---
 
 ## 音乐抓取

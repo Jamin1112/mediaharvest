@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "MediaHarvest Web",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mediaharvest.web",
+      "args": ["--no-browser"],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "MediaHarvest CLI Selfcheck",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mediaharvest",
+      "args": ["--selfcheck"],
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Attach MediaHarvest Web",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "127.0.0.1",
+        "port": 5678
+      },
+      "justMyCode": true
+    }
+  ]
+}
